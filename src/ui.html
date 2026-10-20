@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rustymagnet</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1f24; --muted:#6a737d; --line:#e4e7eb; --accent:#c2410c; --chip:#f3f4f6; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#14161a; --fg:#e6e8eb; --muted:#9097a0; --line:#2a2e35; --accent:#fb923c; --chip:#22262d; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 20px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; color:var(--accent); }
+  header .stats { color:var(--muted); font-size:12px; margin-left:auto; }
+  form { display:flex; gap:8px; flex:1; min-width:300px; }
+  input, select, button { font:inherit; padding:6px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+  input[type=search] { flex:1; }
+  button { cursor:pointer; }
+  .chips { padding:10px 20px; display:flex; gap:6px; flex-wrap:wrap; border-bottom:1px solid var(--line); }
+  .chip { background:var(--chip); border:1px solid transparent; border-radius:14px; padding:2px 10px; cursor:pointer; font-size:12px; }
+  .chip.on { border-color:var(--accent); color:var(--accent); }
+  main { padding:0 20px 40px; }
+  .meta { color:var(--muted); font-size:12px; padding:10px 0; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-size:12px; color:var(--muted); font-weight:600; }
+  td.num, th.num { text-align:right; white-space:nowrap; }
+  tr.row { cursor:pointer; }
+  tr.row:hover { background:var(--chip); }
+  .name { word-break:break-word; }
+  .tags { margin-top:2px; }
+  .tag { display:inline-block; font-size:11px; color:var(--muted); background:var(--chip); border-radius:4px; padding:0 5px; margin-right:4px; }
+  a { color:var(--accent); text-decoration:none; }
+  .detail td { background:var(--chip); font-size:12px; }
+  .files { max-height:300px; overflow:auto; font-family:ui-monospace, monospace; }
+  .pager { display:flex; gap:8px; justify-content:center; padding:16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>rustymagnet</h1>
+  <form id="f">
+    <input type="search" id="q" placeholder="Search torrents…  (words are AND-ed, -word excludes, word* prefix)" autofocus>
+    <select id="sort">
+      <option value="">Best match</option>
+      <option value="newest">Newest</option>
+      <option value="oldest">Oldest</option>
+      <option value="size">Largest</option>
+      <option value="smallest">Smallest</option>
+      <option value="peers">Most peers</option>
+    </select>
+    <select id="res">
+      <option value="">Any resolution</option>
+      <option>2160p</option><option>1080p</option><option>720p</option><option>576p</option><option>480p</option>
+    </select>
+    <button>Search</button>
+  </form>
+  <div class="stats" id="stats"></div>
+</header>
+<div class="chips" id="chips"></div>
+<main>
+  <div class="meta" id="meta"></div>
+  <table>
+    <thead><tr><th>Name</th><th>Type</th><th class="num">Size</th><th class="num">Files</th><th class="num">Peers</th><th class="num">Discovered</th><th></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="pager"><button id="prev">← Prev</button><button id="next">Next →</button></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const LIMIT = 50;
+const LABELS = { movie:"Movies", tv_show:"TV shows", music:"Music", ebook:"E-books", comic:"Comics", audiobook:"Audiobooks", game:"Games", software:"Software", xxx:"XXX", unknown:"Unknown" };
+let state = { q:"", type:"", sort:"", res:"", offset:0 };
+
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function size(b) { const u=["B","KB","MB","GB","TB","PB"]; let i=0; while (b>=1024 && i<u.length-1) { b/=1024; i++; } return b.toFixed(i?1:0)+" "+u[i]; }
+function ago(iso) { const s=(Date.now()-Date.parse(iso))/1000; if (s<3600) return Math.max(1,Math.round(s/60))+"m"; if (s<86400) return Math.round(s/3600)+"h"; return Math.round(s/86400)+"d"; }
+
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  state = { q:p.get("q")||"", type:p.get("type")||"", sort:p.get("sort")||"", res:p.get("res")||"", offset:+(p.get("offset")||0) };
+  $("q").value = state.q; $("sort").value = state.sort; $("res").value = state.res;
+}
+function writeHash() {
+  const p = new URLSearchParams();
+  for (const [k,v] of Object.entries(state)) if (v) p.set(k, v);
+  location.hash = p.toString();
+}
+
+async function loadStats() {
+  try {
+    const s = await (await fetch("api/stats")).json();
+    let txt = s.torrents.toLocaleString() + " torrents · " + size(s.db_bytes);
+    if (s.crawler) txt += " · " + s.crawler.nodes.toLocaleString() + " DHT nodes · " + s.crawler.fetching + " fetching";
+    $("stats").textContent = txt;
+    const chips = [`<span class="chip ${state.type?"":"on"}" data-t="">All</span>`];
+    for (const [t,n] of Object.entries(s.content_types))
+      chips.push(`<span class="chip ${state.type===t?"on":""}" data-t="${esc(t)}">${esc(LABELS[t]||t)} · ${n.toLocaleString()}</span>`);
+    $("chips").innerHTML = chips.join("");
+  } catch (e) { $("stats").textContent = "stats unavailable"; }
+}
+
+async function search() {
+  const p = new URLSearchParams({ limit:LIMIT, offset:state.offset });
+  if (state.q) p.set("q", state.q);
+  if (state.type) p.set("type", state.type);
+  if (state.sort) p.set("sort", state.sort);
+  if (state.res) p.set("resolution", state.res);
+  $("meta").textContent = "Searching…";
+  const r = await fetch("api/search?" + p);
+  const d = await r.json();
+  if (!r.ok) { $("meta").textContent = d.error; $("rows").innerHTML = ""; return; }
+  const total = d.total.toLocaleString() + (d.total_capped ? "+" : "");
+  $("meta").textContent = `${total} results · ${d.took_ms} ms` + (state.offset ? ` · from ${state.offset+1}` : "");
+  $("rows").innerHTML = d.results.map(t => {
+    const tags = [t.year, t.episodes, t.resolution, t.source, t.video_codec, t.modifiers, t.languages, t.release_group].filter(Boolean)
+      .map(x => `<span class="tag">${esc(x)}</span>`).join("");
+    return `<tr class="row" data-h="${t.info_hash}"><td class="name">${esc(t.name)}<div class="tags">${tags}</div></td>
+      <td>${esc(LABELS[t.content_type]||t.content_type)}</td><td class="num">${size(t.size)}</td><td class="num">${t.files_count}</td>
+      <td class="num">${t.peers}</td><td class="num" title="${esc(t.discovered_at)}">${ago(t.discovered_at)}</td>
+      <td><a href="${esc(t.magnet)}" title="Magnet link" onclick="event.stopPropagation()">magnet</a></td></tr>`;
+  }).join("");
+  $("prev").disabled = state.offset === 0;
+  $("next").disabled = d.results.length < LIMIT;
+}
+
+async function toggleDetail(tr) {
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains("detail")) { next.remove(); return; }
+  const d = await (await fetch("api/torrent/" + tr.dataset.h)).json();
+  const files = d.files.map(f => `${esc(size(f.size)).padStart(10)}  ${esc(f.path)}`).join("\n");
+  const more = d.torrent.files_count > d.files.length ? `\n… and ${d.torrent.files_count - d.files.length} more` : "";
+  const row = document.createElement("tr");
+  row.className = "detail";
+  row.innerHTML = `<td colspan="7"><div>Info hash: <code>${d.torrent.info_hash}</code>${d.torrent.title ? " · Title: " + esc(d.torrent.title) : ""}</div><pre class="files">${files}${more}</pre></td>`;
+  tr.after(row);
+}
+
+$("f").onsubmit = e => { e.preventDefault(); state.q = $("q").value.trim(); state.sort = $("sort").value; state.res = $("res").value; state.offset = 0; writeHash(); };
+$("sort").onchange = $("res").onchange = () => $("f").requestSubmit();
+$("chips").onclick = e => { const c = e.target.closest(".chip"); if (!c) return; state.type = c.dataset.t; state.offset = 0; writeHash(); };
+$("rows").onclick = e => { const tr = e.target.closest("tr.row"); if (tr) toggleDetail(tr); };
+$("prev").onclick = () => { state.offset = Math.max(0, state.offset - LIMIT); writeHash(); };
+$("next").onclick = () => { state.offset += LIMIT; writeHash(); };
+window.onhashchange = () => { readHash(); search(); loadStats(); };
+readHash(); search(); loadStats();
+setInterval(loadStats, 15000);
+</script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+[package]
+name = "rustymagnet"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A lightweight, self-hosted BitTorrent DHT crawler, classifier and search engine (bitmagnet-style)"
+
+[dependencies]
+# Async runtime for the DHT socket, peer connections and the HTTP server.
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
+# SQLite (statically linked, with FTS5) as the only storage backend.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Verifying downloaded metadata against the info hash.
+sha1_smol = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
