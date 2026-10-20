@@ -421,6 +421,11 @@ pub struct Query {
 /// Maximum number of matches counted for the "total" figure.
 pub const COUNT_CAP: u64 = 10_000;
 
+/// Text-only searches sorted by relevance rank only the newest this many
+/// matches, so their cost stops growing with the index. Words with fewer
+/// matches are ranked exactly.
+pub const RANK_WINDOW: u64 = 100_000;
+
 pub struct SearchResult {
     pub rows: Vec<Row>,
     /// Number of matches, capped at `COUNT_CAP`.
@@ -561,9 +566,43 @@ impl Reader {
             (Sort::Peers, _) => "t.peers DESC, t.id DESC",
         };
         let limit = q.limit.clamp(1, 500);
-        let sql =
-            format!("SELECT {ROW_COLS} FROM {from} {where_sql} ORDER BY {order} LIMIT {limit} OFFSET {}", q.offset);
-        let count_sql = format!("SELECT count(*) FROM (SELECT 1 FROM {from} {where_sql} LIMIT {})", COUNT_CAP + 1);
+        // Text-only search ordered by an FTS column: rank, page and count inside
+        // the FTS index and only look up the `torrents` rows that are returned,
+        // instead of one (often uncached) row per match.
+        let fts_only = fts.is_some() && wh.len() == 1;
+        let fts_order = match q.sort {
+            Sort::Relevance => Some(("rank", "f.rank")),
+            Sort::Newest => Some(("rowid DESC", "t.id DESC")),
+            Sort::Oldest => Some(("rowid ASC", "t.id ASC")),
+            _ => None,
+        };
+        let (sql, count_sql) = match fts_order.filter(|_| fts_only) {
+            Some((inner, outer)) => (
+                format!(
+                    "SELECT {ROW_COLS} FROM (SELECT rowid, rank FROM {} ORDER BY {inner} LIMIT {limit} OFFSET {}) f
+                     JOIN torrents t ON t.id = f.rowid ORDER BY {outer}",
+                    if q.sort == Sort::Relevance {
+                        // bm25 costs a little per match; very common words would
+                        // otherwise score millions of rows. Rank the newest ones.
+                        format!(
+                            "(SELECT rowid, rank FROM torrents_fts WHERE torrents_fts MATCH ?1
+                             ORDER BY rowid DESC LIMIT {RANK_WINDOW})"
+                        )
+                    } else {
+                        "torrents_fts WHERE torrents_fts MATCH ?1".to_string()
+                    },
+                    q.offset
+                ),
+                format!(
+                    "SELECT count(*) FROM (SELECT 1 FROM torrents_fts WHERE torrents_fts MATCH ?1 LIMIT {})",
+                    COUNT_CAP + 1
+                ),
+            ),
+            None => (
+                format!("SELECT {ROW_COLS} FROM {from} {where_sql} ORDER BY {order} LIMIT {limit} OFFSET {}", q.offset),
+                format!("SELECT count(*) FROM (SELECT 1 FROM {from} {where_sql} LIMIT {})", COUNT_CAP + 1),
+            ),
+        };
         let unfiltered = fts.is_none() && wh.is_empty();
         self.with_conn(|c| {
             let rows = c
@@ -728,5 +767,198 @@ mod tests {
         assert_eq!(r.counts().unwrap().iter().map(|c| c.1).sum::<u64>(), 3);
 
         let _ = std::fs::remove_dir_all(cfg.path.parent().unwrap());
+    }
+
+    #[test]
+    fn text_only_search_pages_in_fts() {
+        let cfg = temp_cfg("fts-only");
+        let stats = Arc::new(WriterStats::default());
+        let (tx, handle) = spawn_writer(cfg.clone(), stats).unwrap();
+        for i in 1..=5u8 {
+            let name = format!("Common.Show.Part{i}.{}", if i == 3 { "common.common" } else { "x" });
+            tx.send(WriteMsg::Insert(mk(i, &name, &[(&name, u64::from(i) << 20)]))).unwrap();
+        }
+        tx.send(WriteMsg::Insert(mk(9, "unrelated", &[("unrelated", 1)]))).unwrap();
+        drop(tx);
+        handle.join().unwrap();
+        let r = Reader::new(cfg.clone()).unwrap();
+        let names = |q: Query| -> (Vec<String>, u64) {
+            let res = r.search(&q).unwrap();
+            (res.rows.into_iter().map(|r| r.name).collect(), res.total)
+        };
+        let base = Query { text: "common".into(), limit: 2, ..Default::default() };
+
+        let (rows, total) = names(Query { sort: Sort::Newest, ..base.clone() });
+        assert_eq!(total, 5);
+        assert_eq!(rows, ["Common.Show.Part5.x", "Common.Show.Part4.x"]);
+        let (rows, _) = names(Query { sort: Sort::Newest, offset: 4, ..base.clone() });
+        assert_eq!(rows, ["Common.Show.Part1.x"]);
+        let (rows, _) = names(Query { sort: Sort::Oldest, ..base.clone() });
+        assert_eq!(rows, ["Common.Show.Part1.x", "Common.Show.Part2.x"]);
+        // The name mentioning the word three times ranks first.
+        let (rows, total) = names(Query { sort: Sort::Relevance, ..base.clone() });
+        assert_eq!(total, 5);
+        assert_eq!(rows[0], "Common.Show.Part3.common.common");
+        // Other sorts and filters still go through the join.
+        let (rows, _) = names(Query { sort: Sort::Largest, ..base.clone() });
+        assert_eq!(rows, ["Common.Show.Part5.x", "Common.Show.Part4.x"]);
+        let (_, total) = names(Query { min_size: Some(3 << 20), ..base });
+        assert_eq!(total, 3);
+
+        let _ = std::fs::remove_dir_all(cfg.path.parent().unwrap());
+    }
+}
+
+/// Synthetic scale benchmark: fills a database with crawler-like torrents
+/// (names, file lists, file-name FTS) and prints where the bytes go.
+///
+/// RUSTYMAGNET_BENCH_DB=/tmp/bench.db RUSTYMAGNET_BENCH_N=1000000 \
+///     cargo test --release bench_fill -- --ignored --nocapture
+///
+/// Re-running with the same path appends N more torrents. Query timings are
+/// taken against `rustymagnet serve --db <path>` afterwards.
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::torrent::File;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// Roughly Zipf(1)-distributed rank in `0..n` (log-uniform).
+        fn zipf(&mut self, n: usize) -> usize {
+            ((n as f64).powf(self.unit()) as usize).saturating_sub(1).min(n - 1)
+        }
+    }
+
+    fn vocabulary(rng: &mut Rng, n: usize) -> Vec<String> {
+        const SYL: [&str; 24] = [
+            "ka", "lo", "mi", "ra", "ten", "su", "vor", "an", "el", "is", "ta", "ne", "do", "ri", "ma", "go", "be",
+            "zu", "ok", "ul", "pre", "sto", "fa", "qui",
+        ];
+        (0..n)
+            .map(|_| {
+                let k = 2 + rng.below(3);
+                let mut w: String = (0..k).map(|_| SYL[rng.below(SYL.len() as u64) as usize]).collect();
+                if let Some(c) = w.get_mut(0..1) {
+                    c.make_ascii_uppercase();
+                }
+                w
+            })
+            .collect()
+    }
+
+    fn words(rng: &mut Rng, vocab: &[String], n: u64) -> Vec<String> {
+        (0..n).map(|_| vocab[rng.zipf(vocab.len())].clone()).collect()
+    }
+
+    fn torrent(rng: &mut Rng, vocab: &[String], hash_seed: u64) -> Box<NewTorrent> {
+        const RES: [&str; 4] = ["1080p", "720p", "2160p", "480p"];
+        const SRC: [&str; 4] = ["WEB-DL", "BluRay", "WEBRip", "HDTV"];
+        const CODEC: [&str; 3] = ["x264", "x265", "H264"];
+        const EXT: [&str; 8] = ["mkv", "mp4", "flac", "mp3", "jpg", "txt", "pdf", "srt"];
+        let k = 2 + rng.below(5);
+        let mut parts = words(rng, vocab, k);
+        match rng.below(10) {
+            0..=3 => parts.push(format!("{}", 1960 + rng.below(66))),
+            4..=6 => parts.push(format!("S{:02}E{:02}", 1 + rng.below(12), 1 + rng.below(24))),
+            _ => {}
+        }
+        if rng.below(10) < 6 {
+            parts.push(RES[rng.zipf(RES.len())].into());
+            parts.push(SRC[rng.below(4) as usize].into());
+            parts.push(format!("{}-{}", CODEC[rng.below(3) as usize], vocab[rng.zipf(2000)]));
+        }
+        let name = parts.join(".");
+        // Mostly single files or small packs, with a long tail of big ones.
+        let nfiles = match rng.below(100) {
+            0..=44 => 1,
+            45..=74 => 2 + rng.below(9),
+            75..=93 => 11 + rng.below(140),
+            _ => 151 + rng.below(1850),
+        } as usize;
+        let files: Vec<File> = if nfiles == 1 {
+            vec![File { path: name.clone(), size: rng.below(20 << 30) }]
+        } else {
+            let sub = words(rng, vocab, 1).join(" ");
+            (0..nfiles)
+                .map(|i| {
+                    let k = 1 + rng.below(4);
+                    let title = words(rng, vocab, k).join(" ");
+                    let ext = EXT[rng.below(EXT.len() as u64) as usize];
+                    File { path: format!("{sub}/{:02} - {title}.{ext}", i + 1), size: rng.below(2 << 30) }
+                })
+                .collect()
+        };
+        let info = TorrentInfo {
+            name,
+            size: files.iter().map(|f| f.size).sum(),
+            files_count: files.len() as u64,
+            files,
+            private: false,
+        };
+        let mut h = [0u8; 20];
+        h.copy_from_slice(&sha1_smol::Sha1::from(hash_seed.to_le_bytes()).digest().bytes());
+        Box::new(NewTorrent::new(h, info, rng.below(200) as u32))
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_fill() {
+        let path: PathBuf = std::env::var("RUSTYMAGNET_BENCH_DB").unwrap_or("/tmp/rustymagnet-bench.db".into()).into();
+        let n: u64 = std::env::var("RUSTYMAGNET_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+        let cfg = StoreConfig { path, cache_mb: 64, index_files: true };
+        let mut conn = open_rw(&cfg).unwrap();
+        let start: u64 =
+            conn.query_row("SELECT coalesce(max(id), 0) FROM torrents", [], |r| r.get::<_, i64>(0)).unwrap() as u64;
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let vocab = vocabulary(&mut rng, 300_000);
+        eprintln!(
+            "words by frequency rank 0/10/1000/100000: {} {} {} {}",
+            vocab[0], vocab[10], vocab[1000], vocab[100_000]
+        );
+        let mut rng = Rng(0x1234_5678 ^ start.wrapping_mul(0x9e37_79b9));
+        let t0 = Instant::now();
+        let mut done = 0;
+        while done < n {
+            let batch: Vec<Box<NewTorrent>> =
+                (0..1000.min(n - done)).map(|i| torrent(&mut rng, &vocab, start + done + i)).collect();
+            write_batch(&mut conn, &batch, true).unwrap();
+            done += batch.len() as u64;
+            if done % 100_000 == 0 {
+                eprintln!("{done} torrents, {:.0} s", t0.elapsed().as_secs_f64());
+            }
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let total: i64 = conn.query_row("SELECT count(*) FROM torrents", [], |r| r.get(0)).unwrap();
+        let mut stmt = conn.prepare("SELECT name, sum(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC").unwrap();
+        let rows: Vec<(String, i64)> =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<_>>().unwrap();
+        let sum: i64 = rows.iter().map(|r| r.1).sum();
+        eprintln!(
+            "{total} torrents, {:.1} MiB, {:.0} bytes/torrent",
+            sum as f64 / 1048576.0,
+            sum as f64 / total as f64
+        );
+        for (name, bytes) in rows {
+            eprintln!(
+                "  {name:<28} {:>10.1} MiB {:>6.0} B/torrent",
+                bytes as f64 / 1048576.0,
+                bytes as f64 / total as f64
+            );
+        }
     }
 }

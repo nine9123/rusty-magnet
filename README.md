@@ -52,6 +52,10 @@ Measured in the development container with 3 000 000 synthetic torrents imported
 Real crawled torrents also store their file lists, so expect a bigger database per torrent.
 You can shrink it with `--no-file-index`, which only indexes torrent names for search.
 
+For sizing a large index (15 M crawled-like torrents, 65 GB: disk, RAM, search times and
+what is still slow), see [docs/scaling.md](docs/scaling.md). Text searches sorted by relevance
+rank the newest 100 000 matches, so very common words stay fast on a large index.
+
 ## Running
 
 ### Docker (recommended on a NAS)
