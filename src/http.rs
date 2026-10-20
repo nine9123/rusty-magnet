@@ -145,15 +145,12 @@ pub fn percent_decode(s: &str) -> String {
     while i < b.len() {
         match b[i] {
             b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
-                    Ok(v) => {
-                        out.push(v);
-                        i += 3;
-                        continue;
-                    }
-                    Err(_) => out.push(b'%'),
-                }
+            b'%' if i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() => {
+                // Both bytes are ASCII hex digits, so this cannot fail.
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("0");
+                out.push(u8::from_str_radix(hex, 16).unwrap_or(0));
+                i += 3;
+                continue;
             }
             c => out.push(c),
         }
@@ -593,10 +590,11 @@ mod tests {
 
     #[test]
     fn query_parsing() {
-        let p = parse_query("q=the+matrix%20199%39&type=movie,tv_show&x=%zz&y=%4");
+        let p = parse_query("q=the+matrix%20199%39&type=movie,tv_show&x=%zz&y=%4&z=%+4");
         assert_eq!(param(&p, "q"), Some("the matrix 1999"));
         assert_eq!(param(&p, "x"), Some("%zz"));
         assert_eq!(param(&p, "y"), Some("%4"));
+        assert_eq!(param(&p, "z"), Some("% 4"));
         let q = build_query(&p).unwrap();
         assert_eq!(q.types, vec![Some(ContentType::Movie), Some(ContentType::TvShow)]);
         assert_eq!(q.sort, Sort::Relevance);

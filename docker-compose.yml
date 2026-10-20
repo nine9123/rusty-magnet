@@ -7,6 +7,9 @@ services:
       - "3333:3333"      # web UI, JSON API, Torznab
       - "3334:3334/udp"  # DHT (forward this UDP port on your router for best results)
     volumes:
+      # The container runs as uid 1000: create ./data owned by it first
+      # (mkdir data && sudo chown 1000:1000 data), or Docker creates it as root
+      # and the database cannot be written.
       - ./data:/data
     environment:
       RUSTYMAGNET_RATE: "150"       # outgoing DHT queries per second (see README before raising)

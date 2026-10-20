@@ -1,0 +1,66 @@
+name: Build image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: gitea.internal:30008
+  IMAGE_NAME: nine9/rusty-magnet
+  # Base images for the Dockerfile's two stages. Default to Docker Hub; set
+  # the repository variables RUST_IMAGE / BASE_IMAGE to a mirror or a copy in
+  # the Gitea registry if the runner can't reach Docker Hub reliably.
+  RUST_IMAGE: ${{ vars.RUST_IMAGE || 'rust:1-slim-bookworm' }}
+  BASE_IMAGE: ${{ vars.BASE_IMAGE || 'debian:bookworm-slim' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Gitea registry
+        run: |
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login ${{ env.REGISTRY }} \
+            -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+
+      # Docker Hub from the runner times out now and then (TLS handshake
+      # timeout on auth.docker.io). Pull the base images with retries first;
+      # the build then uses the local copies instead of going back to the hub.
+      - name: Pull base images
+        run: |
+          for image in "${{ env.RUST_IMAGE }}" "${{ env.BASE_IMAGE }}"; do
+            pulled=false
+            for attempt in 1 2 3 4 5; do
+              if docker pull --platform linux/amd64 "${image}"; then
+                pulled=true
+                break
+              fi
+              echo "Pull of ${image}, attempt ${attempt} failed, retrying in $((attempt * 15))s"
+              sleep $((attempt * 15))
+            done
+            if [ "${pulled}" != true ]; then
+              echo "Could not pull ${image} after 5 attempts" >&2
+              exit 1
+            fi
+          done
+
+      - name: Build image
+        run: |
+          SHA_SHORT=$(echo "${{ gitea.sha }}" | cut -c1-8)
+          docker build \
+            --platform linux/amd64 \
+            --build-arg RUST_IMAGE="${{ env.RUST_IMAGE }}" \
+            --build-arg BASE_IMAGE="${{ env.BASE_IMAGE }}" \
+            --label "org.opencontainers.image.revision=${{ gitea.sha }}" \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHA_SHORT} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+          echo "SHA_SHORT=${SHA_SHORT}" >> "$GITEA_ENV"
+
+      - name: Push image
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.SHA_SHORT }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
