@@ -1,0 +1,16 @@
+services:
+  rustymagnet:
+    build: .
+    container_name: rustymagnet
+    restart: unless-stopped
+    ports:
+      - "3333:3333"      # web UI, JSON API, Torznab
+      - "3334:3334/udp"  # DHT (forward this UDP port on your router for best results)
+    volumes:
+      - ./data:/data
+    environment:
+      RUSTYMAGNET_RATE: "150"       # outgoing DHT queries per second (see README before raising)
+      RUSTYMAGNET_FETCHERS: "64"    # torrents whose metadata is fetched concurrently
+      RUSTYMAGNET_CACHE_MB: "64"    # SQLite page cache per connection
+      # RUSTYMAGNET_SKIP_XXX: "1"
+      # RUSTYMAGNET_NO_FILE_INDEX: "1"
