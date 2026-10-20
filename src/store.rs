@@ -571,7 +571,8 @@ impl Reader {
         // instead of one (often uncached) row per match.
         let fts_only = fts.is_some() && wh.len() == 1;
         let fts_order = match q.sort {
-            Sort::Relevance => Some(("rank", "f.rank")),
+            // Newest first among equal ranks, so pages don't overlap or skip.
+            Sort::Relevance => Some(("rank, rowid DESC", "f.rank, t.id DESC")),
             Sort::Newest => Some(("rowid DESC", "t.id DESC")),
             Sort::Oldest => Some(("rowid ASC", "t.id ASC")),
             _ => None,
@@ -798,7 +799,10 @@ mod tests {
         // The name mentioning the word three times ranks first.
         let (rows, total) = names(Query { sort: Sort::Relevance, ..base.clone() });
         assert_eq!(total, 5);
-        assert_eq!(rows[0], "Common.Show.Part3.common.common");
+        assert_eq!(rows, ["Common.Show.Part3.common.common", "Common.Show.Part5.x"]);
+        // Equal ranks page newest first without overlap.
+        let (rows, _) = names(Query { sort: Sort::Relevance, offset: 2, ..base.clone() });
+        assert_eq!(rows, ["Common.Show.Part4.x", "Common.Show.Part2.x"]);
         // Other sorts and filters still go through the join.
         let (rows, _) = names(Query { sort: Sort::Largest, ..base.clone() });
         assert_eq!(rows, ["Common.Show.Part5.x", "Common.Show.Part4.x"]);

@@ -118,7 +118,9 @@ by relevance, newest or oldest:
    used to score every match, millions of rows for a common word.
 
 Queries with filters (type, year, resolution, season, size) or sorted by size or peers take
-the old path unchanged, so Torznab and filtered results are exactly as before.
+the old path unchanged, so filtered results are exactly as before. Torznab requests with a
+category, or `t=tvsearch`/`movie`/`music`/`book`, are filtered by type and also unchanged. A
+plain `t=search&q=...` without `cat` takes the new path, relevance window included.
 
 ## Plan
 
