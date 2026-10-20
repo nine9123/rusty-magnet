@@ -338,10 +338,14 @@ impl Crawler {
             Some(Message::Error { tid }) => {
                 if let Some(p) = take_pending(&mut self.pending, &tid, from) {
                     self.mark_responded(from);
-                    if let (Kind::Sample, Some(n)) = (p.kind, self.nodes.get_mut(&from)) {
-                        n.bep51 = Some(false);
-                        // No BEP 51 support: ask for its neighbours instead, right away.
-                        self.fresh.push_front(from);
+                    match (p.kind, self.nodes.get_mut(&from)) {
+                        (Kind::Sample, Some(n)) => {
+                            n.bep51 = Some(false);
+                            // No BEP 51 support: ask for its neighbours instead, right away.
+                            self.fresh.push_front(from);
+                        }
+                        (Kind::GetPeers(hash), _) => self.get_peers_failed(hash),
+                        _ => {}
                     }
                 }
             }
@@ -442,7 +446,12 @@ impl Crawler {
 
     fn on_response(&mut self, tid: &[u8], body: &Value, from: SocketAddr) {
         let Some(p) = take_pending(&mut self.pending, tid, from) else { return };
-        let Some(rid) = krpc::id_of(body) else { return };
+        let Some(rid) = krpc::id_of(body) else {
+            if let Kind::GetPeers(hash) = p.kind {
+                self.get_peers_failed(hash);
+            }
+            return;
+        };
         self.add_node(rid, from);
         let now = Instant::now();
         self.mark_responded(from);
@@ -604,6 +613,15 @@ impl Crawler {
         }
     }
 
+    /// A get_peers query of the lookup for `hash` timed out or was answered
+    /// with an error: move on to the next candidate.
+    fn get_peers_failed(&mut self, hash: InfoHash) {
+        if let Some(l) = self.lookups.get_mut(&hash) {
+            l.in_flight = l.in_flight.saturating_sub(1);
+            self.advance_lookup(hash);
+        }
+    }
+
     fn dispatch(&mut self, hash: InfoHash) {
         let Some(l) = self.lookups.remove(&hash) else { return };
         self.stats.lookups.store(self.lookups.len() as u64, Relaxed);
@@ -662,10 +680,7 @@ impl Crawler {
                 }
             }
             if let Kind::GetPeers(hash) = kind {
-                if let Some(l) = self.lookups.get_mut(&hash) {
-                    l.in_flight = l.in_flight.saturating_sub(1);
-                    self.advance_lookup(hash);
-                }
+                self.get_peers_failed(hash);
             }
         }
         // Expire slow lookups: fetch with whatever peers were found.
@@ -809,5 +824,31 @@ async fn fetch_dispatcher(
             drop(permit);
             let _ = done.send(FetchDone { hash, ok, torrent }).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn get_peers_error_ends_lookup() {
+        let cfg = CrawlerConfig { port: 0, ..Default::default() };
+        let (writer, _rx) = std::sync::mpsc::sync_channel(1);
+        let mut c = Crawler::bind(cfg, Arc::new(Bloom::new(1000, 0.01)), writer, Arc::new(CrawlerStats::default()))
+            .await
+            .unwrap();
+        let hash: InfoHash = [5; 20];
+        let node: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        c.discovered(hash, Some((Some([6; 20]), node)));
+        assert_eq!(c.lookups[&hash].in_flight, 1);
+        // Pretend the queued get_peers was sent, then the node answers with an error.
+        c.lookup_queue.clear();
+        c.pending.insert(7, Pending { kind: Kind::GetPeers(hash), addr: node, sent: Instant::now() });
+        c.on_packet(&krpc::error(&7u32.to_be_bytes(), 201, "nope"), node);
+        // No candidates left: the lookup ends at once instead of waiting for LOOKUP_TIMEOUT.
+        assert!(!c.lookups.contains_key(&hash));
+        assert!(!c.in_flight.contains(&hash));
+        assert!(c.failed.contains_key(&hash));
     }
 }

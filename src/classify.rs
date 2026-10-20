@@ -695,7 +695,8 @@ pub fn classify(name: &str, files: &[File]) -> Classification {
     let mut episode_like_files = 0usize;
     for f in files {
         let k = ext_kind(&f.path);
-        sizes[k as usize] += f.size.max(1);
+        // Saturating: sizes come straight from untrusted metadata.
+        sizes[k as usize] = sizes[k as usize].saturating_add(f.size.max(1));
         if k == Kind::Video && f.size > 50 << 20 {
             video_files += 1;
             let base = f.path.rsplit('/').next().unwrap_or(&f.path);
@@ -840,6 +841,13 @@ mod tests {
         assert_eq!(c.source, Some("BluRay"));
         assert_eq!(c.video_codec, Some("H.264"));
         assert_eq!(c.release_group.as_deref(), Some("SPARKS"));
+    }
+
+    #[test]
+    fn huge_file_sizes_do_not_overflow() {
+        let big = File { path: "a.mkv".into(), size: i64::MAX as u64 };
+        let c = classify("Huge.2020.1080p", &[big.clone(), big.clone(), big]);
+        assert_eq!(c.content_type, Some(ContentType::Movie));
     }
 
     #[test]

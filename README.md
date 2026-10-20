@@ -60,9 +60,19 @@ You can shrink it with `--no-file-index`, which only indexes torrent names for s
 docker compose up -d --build
 ```
 
+The container runs as uid 1000, so `./data` must be writable by that user. Create it
+first with `mkdir data && sudo chown 1000:1000 data`; if Docker creates it, it is owned
+by root and the database cannot be opened.
+
 Then open `http://<nas>:3333/`. Forward **UDP 3334** on your router: the crawler works
 without it, but the DHT sends you far more traffic (and announces) when other nodes can
 reach you. Peer connections are outbound only.
+
+The Gitea workflow in `.gitea/workflows/build.yml` builds the image on every push to
+`main` and pushes it as `gitea.internal:30008/nine9/rusty-magnet:<sha8>` and `:latest`.
+It needs the repository secrets `REGISTRY_USER` and `REGISTRY_TOKEN`. If the runner can't
+reach Docker Hub reliably, set the repository variables `RUST_IMAGE` and `BASE_IMAGE` to
+copies of `rust:1-slim-bookworm` and `debian:bookworm-slim` in your own registry.
 
 ### Bare metal
 
