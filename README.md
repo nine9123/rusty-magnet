@@ -60,9 +60,10 @@ You can shrink it with `--no-file-index`, which only indexes torrent names for s
 docker compose up -d --build
 ```
 
-The container runs as uid 1000, so `./data` must be writable by that user. Create it
-first with `mkdir data && sudo chown 1000:1000 data`; if Docker creates it, it is owned
-by root and the database cannot be opened.
+The container starts as root only long enough to make `./data` owned by `PUID:PGID`
+(default `1000:1000`, set in `docker-compose.yml`), then runs rustymagnet as that user.
+If you run it with `user:` instead, `./data` must already be writable by that user
+(`sudo chown -R <uid>:<gid> data`); otherwise the container exits at once and says so.
 
 Then open `http://<nas>:3333/`. Forward **UDP 3334** on your router: the crawler works
 without it, but the DHT sends you far more traffic (and announces) when other nodes can
