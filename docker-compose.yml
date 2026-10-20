@@ -7,11 +7,12 @@ services:
       - "3333:3333"      # web UI, JSON API, Torznab
       - "3334:3334/udp"  # DHT (forward this UDP port on your router for best results)
     volumes:
-      # The container runs as uid 1000: create ./data owned by it first
-      # (mkdir data && sudo chown 1000:1000 data), or Docker creates it as root
-      # and the database cannot be written.
+      # The entrypoint makes this directory owned by PUID:PGID (below) and
+      # then runs rustymagnet as that user.
       - ./data:/data
     environment:
+      PUID: "1000"                  # user / group that owns ./data and runs the crawler
+      PGID: "1000"
       RUSTYMAGNET_RATE: "150"       # outgoing DHT queries per second (see README before raising)
       RUSTYMAGNET_FETCHERS: "64"    # torrents whose metadata is fetched concurrently
       RUSTYMAGNET_CACHE_MB: "64"    # SQLite page cache per connection
