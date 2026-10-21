@@ -16,9 +16,9 @@ reproduce them. The machine was a 16-core container with 7.7 GB RAM and SSD-back
 |---|---|
 | Will the size hold? | **Yes.** At 15 M torrents the file is 65 GB and the writer still inserts ~6 600 torrents/s, about 4 000× what the crawler delivers. SQLite's limits are far away. |
 | How long to get there? | At ~130 000 torrents/day (README, `--rate 150`): **~90 days to 50 GB, ~145 days to 80 GB**. bitmagnet users report ~5 000 torrents/hour and 12 M torrents after about 4 months, which agrees. Expect the rate to fall once the popular part of the DHT is known. For comparison, bitmagnet's FAQ plans for ~80 GB per 10 M torrents; here that is ~45 GB. |
-| RAM | **The process itself stays small: 59 MB at start-up with 15 M torrents known, 92 MB after 3 minutes of crawling.** Broad searches push it higher: text plus a type filter took ~260 MB of heap, and a 2-letter prefix search peaked at ~630 MB RSS (plan steps 3–5 fix both). `docker stats` also counts the database file's page cache, which is why today's 140 MB looks bigger than the process. Set the container limit to **1 GB**. |
-| Will SQLite manage? | **Writes, yes, easily. Reads, yes, if queries are bounded.** The danger is queries whose cost grows with the number of *matches* (relevance ranking, size sorts, prefix searches). Those took 5–80 s at 15 M before. This change fixes the most common one; the plan covers the rest. |
-| Will search be reasonable? | **Plain text search: yes**, 15–250 ms warm at 15 M after this change (4.5–13.7 s before). **Text + filter, size sorts, `ab*` prefixes: not yet**, 1–12 s warm and up to 80 s cold. See plan steps 2–5. |
+| RAM | **The process itself stays small: 59 MB at start-up with 15 M torrents known, 92 MB after 3 minutes of crawling.** Broad searches used to push it higher (text plus a type filter ~260 MB of heap, a 2-letter prefix search ~630 MB peak RSS). Since plan steps 2–6, the whole query suite at 3 M peaks at 146 MB RSS (397 MB before), and SQLite's heap is capped at 448 MB. `docker stats` also counts the database file's page cache, which is why today's 140 MB looks bigger than the process. Set the container limit to **1 GB**. |
+| Will SQLite manage? | **Writes, yes, easily. Reads, yes, if queries are bounded.** The danger is queries whose cost grows with the number of *matches* (relevance ranking, size sorts, prefix searches). Those took 5–80 s at 15 M. Plan steps 1–6 bound all the common ones, and anything left over is stopped after 3 s. |
+| Will search be reasonable? | **Yes.** Plain text search: 15–250 ms warm at 15 M (4.5–13.7 s before step 1). Text + filter, size/peers sorts and filter-only browsing took 1.4–6.5 s cold and up to 1.9 s warm at 3 M. After a one-off `reindex` they take 0–0.5 s cold (two at 1.5–2 s) and 0–0.13 s warm (see [Filters, sorts and guard rails](#filters-sorts-and-guard-rails-plan-steps-27)). I did not re-measure at 15 M. |
 
 ## Where the bytes go
 
@@ -104,7 +104,7 @@ database on SSD if the NAS has one.
 At 3 M torrents (13 GB) the old code already took 1.8 s warm for the most common word, and
 the new code 57 ms. The old cost grew linearly with the index; the new cost is roughly flat.
 
-### What changed in this PR
+### Bounded text search (plan step 1)
 
 `Reader::search` in `src/store.rs`: when a query has text and no other filters and is sorted
 by relevance, newest or oldest:
@@ -114,51 +114,118 @@ by relevance, newest or oldest:
 2. Relevance ranks only the **newest 100 000 matches** (`RANK_WINDOW`). Words with fewer
    matches are ranked exactly, as before. For very common words, an old torrent that would
    have ranked highly may now be missing from the relevance view. It is still found with
-   more words, a filter, or `sort=oldest`. Most of the speed-up comes from this, because bm25
+   more words, a filter that narrows the matches, or `sort=oldest`. Most of the speed-up comes from this, because bm25
    used to score every match, millions of rows for a common word.
 
-Queries with filters (type, year, resolution, season, size) or sorted by size or peers take
-the old path unchanged, so filtered results are exactly as before. Torznab requests with a
-category, or `t=tvsearch`/`movie`/`music`/`book`, are filtered by type and also unchanged. A
-plain `t=search&q=...` without `cat` takes the new path, relevance window included.
+When step 1 shipped, queries with filters or sorted by size or peers still took the old
+path. Steps 2–7 below cover those.
+
+## Filters, sorts and guard rails (plan steps 2–7)
+
+Measured on a 3 M torrent database (13.8 GB, same generator) that was built by the previous
+version, so the same file gives all three columns. "Before" is the previous binary. "No tags"
+is the new binary before `reindex`, which is what a large existing database runs until someone
+reindexes it; there, ✗ means stopped by the 3 s limit. "After" is after `reindex`, run with
+the limit off so the real cost shows. Times in ms, cold / warm, limit 50.
+
+| Query | Before | No tags | **After** |
+|---|---:|---:|---:|
+| `1080p`, sort size | 6 542 / 225 | 473 / 33 | **424 / 34** |
+| `1080p`, sort peers | 4 188 / 230 | 470 / 31 | **468 / 30** |
+| `1080p` + `type=movie` | 1 359 / 645 | 1 061 / 645 | **208 / 67** |
+| most common word + `type=movie` | 2 222 / 1 877 | 2 362 / 1 904 | **264 / 131** |
+| common word + `year=1999` | 6 516 / 840 | ✗ | **202 / 34** |
+| common word + `resolution=720p`, sort size | 3 947 / 226 | ✗ | **1 998 / 87** |
+| `ka*` (2-letter prefix) | 2 533 / 2 299 | 0 / 0 | **0 / 0** |
+| `kao*` (3-letter prefix) | 242 / 181 | 266 / 219 | **315 / 214** |
+| `year=1999`, no text | 2 503 / 92 | 1 905 / 95 | **4 / 0** |
+| `year=1999`, sort size | 4 013 / 267 | ✗ | **316 / 12** |
+| `type=movie`, sort size | 4 548 / 221 | 16 / 0 | **8 / 0** |
+| `type=tv_show&season=2&episode=3` | 4 517 / 177 | ✗ | **1 467 / 61** |
+| browse, sort size | 4 203 / 184 | 6 / 0 | **4 / 0** |
+| browse, sort peers | 5 325 / 217 | 0 / 0 | **1 / 0** |
+| peak RSS after the whole suite | 397 MB | 391 MB | **146 MB** |
+
+Plain text searches are unchanged (within noise). The "No tags" warm values after a ✗ are
+not really warm, because the interrupted cold run left part of the data unread.
+
+I compared the results of 15 filtered and sorted queries between the old and new binary on this
+file. Totals and the set of rows are identical everywhere. The only difference is the order of
+rows with equal relevance in text + filter queries: those are now newest first, like text-only
+searches.
+
+What changed, in `src/store.rs` unless noted:
+
+- **Step 2, sort indexes.** `torrents_size` and `torrents_peers (peers, id)`.
+  They are ~42 MiB each at 3 M, so ~0.2 GB each at 15 M, not the 0.5 GB estimated. Creating them
+  on the existing 3 M database took 4 s at start-up (logged). Expect about a minute at 15 M on
+  SSD, longer on spinning disks. Text sorted by size or peers sorts the newest
+  100 000 matches (`RANK_WINDOW`), the same trade-off as relevance. Without text, the type
+  filter is kept off its index (`+t.content_type`) so that SQLite walks the size index instead of
+  sorting every movie.
+- **Step 3, filters in the search index.** The FTS table has a third column, `tags`, with
+  tokens like `ct1` (type id, `ct0` = unknown), `y1999`, `r1080p`, `s2`. Its bm25 weight is 0, and
+  the user's text is restricted to `{name files}`, so neither ranking nor matching changes. Type,
+  year, resolution and season become `AND tags : ...` in the FTS query, and the bounded path from
+  step 1 handles them (relevance and newest/oldest; size and peers use the window above). Episode and size filters are still checked on the rows. The column adds
+  30 MiB (1.4 %) to the 2.1 GB index at 3 M.
+  - New databases get the column straight away. On an existing database, `run`/`serve` rebuild
+    the index at start-up up to 1 M torrents (`AUTO_REINDEX_MAX`). Above that they log a warning
+    and keep working the old way until you stop the container and run `rustymagnet reindex`.
+  - `reindex` built the new index for 3 M torrents in **2 min 50 s** (~17 500 torrents/s, 377 MB
+    peak RSS). That is **~15 min at 15 M on SSD**, much less than the "hours" I had estimated. Expect
+    several times that on spinning disks. It writes into a new table and swaps it in at the end,
+    so an interrupted run leaves the old index in place, and the next `reindex` starts over. It needs free disk
+    space for a second copy of the index (~11 GB at 15 M). The old index's pages stay in the file
+    as free pages (2.2 GB here), and new torrents reuse them.
+  - `reclassify` rewrites a torrent's index entry when its tags change.
+- **Step 4, prefix searches.** `ab*` needs at least 3 characters before `*` (`MIN_PREFIX`). Shorter
+  ones are searched as the plain word. FTS `prefix=` indexes were not added.
+- **Step 5, guard rails.** A watchdog thread interrupts reader queries after 3 s, configurable with
+  `--query-timeout` / `RUSTYMAGNET_QUERY_TIMEOUT` (0 = off). The API answers 503 with "the search
+  took too long: add more words or filters", and the UI shows that text. The bundled rusqlite has
+  no progress-handler API without the `hooks` feature, so this uses `sqlite3_interrupt` instead.
+  `PRAGMA hard_heap_limit` caps SQLite's heap at 3 × `--cache-mb` + 256 MB (448 MB by default:
+  the writer's page cache, 4 readers at half of it, and headroom). The limit is process-wide, so
+  a query that hits it can also make one writer batch fail. That is logged as `batch insert
+  failed`, and those torrents are not fetched again until the next restart, because the Bloom
+  filter already counts them as known. With the 3 s limit in place I could not get a search
+  anywhere near the cap.
+  **On a spinning-disk NAS, raise the timeout** (for example 10–15 s). Cold reads there are much
+  slower and the 3 s limit would also stop ordinary filtered searches on a cold cache.
+- **Step 6, filter-only browsing.** `year=1999` with no text counts its matches in the search index
+  instead of scanning the table: 2.5 s → 4 ms cold.
 
 ## Plan
 
-In order of value per effort. Step 1 is in this PR; the rest is not started.
+In order of value per effort. Steps 1–6 are done and step 7 is advice; details are in the
+sections above.
 
-1. **Done: bounded text search** (above).
-2. **Indexes for size/peers sorting.** `CREATE INDEX torrents_size ON torrents(size)` and
-   `torrents_peers ON torrents(peers, id)`. Browse by size goes from 0.9 s warm / 79 s cold to
-   milliseconds. Cost: ~0.5 GB each at 15 M, and creating them on an existing large database
-   blocks start-up for a few minutes once. Text + size sort (`1080p&sort=size`) needs the
-   same window treatment as relevance (sort the newest 100 k matches), because an index
-   doesn't help there.
-3. **Filters inside the FTS index.** Text + type is the most common UI action (the chips) and
-   costs 4.6 s warm at 15 M, with ~260 MB of heap. Add a third FTS column with tokens like
-   `t_movie`, `r_1080p`, `y_1999`, `s_02`. Filtering then becomes an FTS `AND` and can use
-   the bounded path from step 1. Needs a one-off `reindex` command that rebuilds the FTS
-   index: hours at 15 M, so do it **while the database is still small**. The cheaper
-   alternative is to apply the rank window to filtered queries too. It's a one-line change,
-   but a common word plus a rare filter could then show no results while the count says
-   there are some, so I did not do it.
-4. **Prefix searches.** Require at least 3 characters before `*`. That's trivial, and `ab*`
-   accounts for most of the 10–30 s and the 630 MB peak. Optionally add `prefix='3'` to the
-   FTS table later, for about +30–50 % index size (estimate).
-5. **Guard rails for SQLite.** Install a progress handler on reader connections that aborts
-   a query after ~3 s ("query too broad, add words"). Set `PRAGMA hard_heap_limit` (for
-   example 256 MB) so that a pathological query fails instead of growing the container. Even
-   if steps 2–4 are skipped, this one keeps the NAS safe.
-6. **Filter-only browsing** (`year=1999` with no text): it is the "10 000+" count that scans
-   the table, 9 s cold. Either lower the count cap for filter-only queries or index `year`
-   and `resolution`. Cheap; decide after step 3.
+1. **Done: bounded text search.**
+2. **Done: indexes for size/peers sorting**, plus the newest-100 k window for text sorted by
+   size or peers.
+3. **Done: filters inside the FTS index.** Existing databases over 1 M torrents need one
+   `rustymagnet reindex`, so run it **while the database is still small** if you can. Still open:
+   episode and size filters are checked on the rows, so text + `min_size` on a very common word
+   is not bounded except by the time limit.
+4. **Done: prefix searches need 3 characters.** Not done: `prefix='3'` on the FTS table
+   (about +30–50 % index size, estimate). Measure `kao*`-style searches on the real data first.
+5. **Done: guard rails** (3 s query limit, heap cap).
+6. **Done: filter-only browsing** counts in the FTS index (needs step 3's `reindex`).
 7. **Operations.**
-   - Keep ≥ 1.5× the database size free if you ever want to `VACUUM`. Otherwise never run
-     it. The file is 65 GB and VACUUM rewrites all of it.
-   - Back up with `sqlite3 rustymagnet.db ".backup /backup/rm.db"` (works online), or stop
-     the container and copy the file. Don't copy a live `.db` without its `-wal`.
-   - Plan for 100 GB of disk, not 80 GB: the WAL, a backup copy and the index additions above.
-   - Watch `db_bytes` in `GET /api/stats` and `docker stats`. A memory limit of 1 GB is safe.
-     512 MB is enough for crawling, but broad searches can hit it until step 5 is done.
+   - **Disk: plan for 100 GB, not 80 GB.** That covers the WAL, the sort indexes (~0.4 GB
+     together at 15 M), a `reindex` (a second copy of the search index, ~11 GB at 15 M, while it
+     runs) and free pages left behind afterwards.
+   - **Never run `VACUUM`.** It rewrites the whole file (65 GB at 15 M), needs that much free
+     space again, and blocks the crawler for the whole time. Free pages from deletes or a
+     `reindex` are reused by new torrents anyway.
+   - **Backups:** `sqlite3 rustymagnet.db ".backup /backup/rm.db"` works while rustymagnet runs
+     and gives a consistent copy. Or stop the container and copy the file. Never copy a live
+     `.db` without its `-wal`.
+   - Watch `db_bytes` in `GET /api/stats` and `docker stats`. A memory limit of 1 GB is safe,
+     and 512 MB should now be enough too, since the heap cap is 448 MB at the default
+     `--cache-mb 64` (not measured under a 512 MB limit).
+   - On a spinning-disk NAS, set `RUSTYMAGNET_QUERY_TIMEOUT` to 10–15.
 
 ## Reproducing
 
@@ -169,6 +236,11 @@ RUSTYMAGNET_BENCH_DB=/tmp/bench/big.db RUSTYMAGNET_BENCH_N=3000000 \
 target/release/rustymagnet serve --db /tmp/bench/big.db --http 127.0.0.1:3399 &
 .claude-task/tools/bench_search.sh /tmp/bench/big.db http://127.0.0.1:3399 $!
 ```
+
+To see what an existing database gains from `reindex`, build it with the previous version first,
+time the searches, then run `target/release/rustymagnet reindex --db /tmp/bench/big.db` and time
+them again. Start `serve` with `RUSTYMAGNET_QUERY_TIMEOUT=0` to measure queries that would
+otherwise be stopped after 3 s.
 
 Running `bench_fill` again on the same file adds N more torrents. Its last lines show the
 per-table breakdown (via SQLite's `dbstat`).

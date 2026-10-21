@@ -53,8 +53,9 @@ Real crawled torrents also store their file lists, so expect a bigger database p
 You can shrink it with `--no-file-index`, which only indexes torrent names for search.
 
 For sizing a large index (15 M crawled-like torrents, 65 GB: disk, RAM, search times and
-what is still slow), see [docs/scaling.md](docs/scaling.md). Text searches sorted by relevance
-rank the newest 100 000 matches, so very common words stay fast on a large index.
+what is still slow), see [docs/scaling.md](docs/scaling.md). Text searches sorted by relevance,
+size or peers sort the newest 100 000 matches, so very common words stay fast on a large index.
+A search that still takes longer than 3 seconds is stopped with "add more words or filters".
 
 ## Running
 
@@ -97,6 +98,7 @@ cargo build --release
 | `--fetchers N` | `RUSTYMAGNET_FETCHERS` | `64` | Torrents whose metadata is fetched concurrently (up to 4 peer connections each) |
 | `--max-nodes N` | `RUSTYMAGNET_MAX_NODES` | `50000` | DHT nodes kept in memory |
 | `--cache-mb N` | `RUSTYMAGNET_CACHE_MB` | `64` | SQLite page cache per connection |
+| `--query-timeout S` | `RUSTYMAGNET_QUERY_TIMEOUT` | `3` | Stop a search after S seconds with "add more words or filters". `0` = never. Raise it if the database is on a slow spinning disk |
 | `--no-file-index` | `RUSTYMAGNET_NO_FILE_INDEX=1` | off | Don't full-text index file names |
 | `--skip-xxx` | `RUSTYMAGNET_SKIP_XXX=1` | off | Don't store adult content |
 
@@ -128,6 +130,11 @@ Commands:
 - `import`: see below.
 - `reclassify`: re-run the classifier over the database after upgrading. This also deletes
   rows that now match the blocklist.
+- `reindex`: rebuild the search index. Databases from before the type/year/resolution/season
+  filters moved into the index need this once. `run` and `serve` do it by themselves at
+  start-up up to 1 M torrents; above that they log a warning and keep working, only filtered
+  searches stay slow. Stop the container first, and expect it to take a while and to need free
+  disk space for a second copy of the index, see [docs/scaling.md](docs/scaling.md).
 
 ## Torznab (Sonarr, Radarr, Prowlarr…)
 
@@ -143,7 +150,8 @@ rustymagnet does not scrape trackers, so treat it as a rough popularity signal.
 - `GET /api/torrent/<info hash hex>` returns the torrent with its file list.
 - `GET /api/stats` returns counts per content type, database size and crawler counters.
 
-The `q` syntax: words are AND-ed, `-word` excludes a word, `word*` matches a prefix.
+The `q` syntax: words are AND-ed, `-word` excludes a word, `word*` matches a prefix of at least
+3 characters (`ab*` searches for the word `ab`).
 
 ## Migrating from bitmagnet
 
