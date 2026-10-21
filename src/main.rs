@@ -33,6 +33,7 @@ COMMANDS:
     serve        Serve the web UI / API only, no crawling
     import       Import `info_hash<TAB>name<TAB>size[<TAB>unix_time]` lines from stdin
     reclassify   Re-run the classifier over every stored torrent
+    reindex      Rebuild the search index (stop the crawler first)
     help         Show this message
 
 OPTIONS (environment variable in brackets):
@@ -43,6 +44,8 @@ OPTIONS (environment variable in brackets):
     --fetchers N       Torrents fetched concurrently     [RUSTYMAGNET_FETCHERS]  (64)
     --max-nodes N      DHT nodes kept in memory          [RUSTYMAGNET_MAX_NODES] (50000)
     --cache-mb N       SQLite page cache per connection  [RUSTYMAGNET_CACHE_MB]  (64)
+    --query-timeout S  Stop searches after S seconds, 0 = never
+                                                         [RUSTYMAGNET_QUERY_TIMEOUT] (3)
     --no-file-index    Only index torrent names for search, not file names
                                                          [RUSTYMAGNET_NO_FILE_INDEX=1]
     --skip-xxx         Do not store adult content        [RUSTYMAGNET_SKIP_XXX=1]
@@ -57,6 +60,7 @@ struct Options {
     crawler: CrawlerConfig,
     cache_mb: u32,
     index_files: bool,
+    query_timeout_s: u64,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -68,6 +72,7 @@ fn parse_args() -> Result<Options, String> {
         http: env("RUSTYMAGNET_HTTP").unwrap_or_else(|| "0.0.0.0:3333".into()),
         crawler: CrawlerConfig::default(),
         cache_mb: 64,
+        query_timeout_s: 3,
         index_files: !matches!(env("RUSTYMAGNET_NO_FILE_INDEX").as_deref(), Some("1" | "true" | "yes")),
     };
     crawler.skip_xxx = matches!(env("RUSTYMAGNET_SKIP_XXX").as_deref(), Some("1" | "true" | "yes"));
@@ -81,6 +86,7 @@ fn parse_args() -> Result<Options, String> {
             "fetchers" => crawler.fetch_concurrency = num(val)?.clamp(1, 10_000) as usize,
             "max-nodes" => crawler.max_nodes = num(val)?.clamp(100, 10_000_000) as usize,
             "cache-mb" => o.cache_mb = num(val)?.clamp(2, 65_536) as u32,
+            "query-timeout" => o.query_timeout_s = num(val)?.min(3600),
             _ => return Err(format!("unknown option --{key}")),
         }
         Ok(())
@@ -91,6 +97,7 @@ fn parse_args() -> Result<Options, String> {
         ("fetchers", "RUSTYMAGNET_FETCHERS"),
         ("max-nodes", "RUSTYMAGNET_MAX_NODES"),
         ("cache-mb", "RUSTYMAGNET_CACHE_MB"),
+        ("query-timeout", "RUSTYMAGNET_QUERY_TIMEOUT"),
     ] {
         if let Some(v) = env(var) {
             set(k, &v, &mut o, &mut crawler)?;
@@ -133,7 +140,12 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let store_cfg = StoreConfig { path: opts.db.clone(), cache_mb: opts.cache_mb, index_files: opts.index_files };
+    let store_cfg = StoreConfig {
+        path: opts.db.clone(),
+        cache_mb: opts.cache_mb,
+        index_files: opts.index_files,
+        query_timeout: (opts.query_timeout_s > 0).then(|| std::time::Duration::from_secs(opts.query_timeout_s)),
+    };
     let result = match opts.command.as_str() {
         "run" => run(&opts, store_cfg, true),
         "serve" => run(&opts, store_cfg, false),
@@ -141,6 +153,7 @@ fn main() {
         "reclassify" => {
             store::reclassify(&store_cfg).map(|n| log_info!("reclassified {n} torrents")).map_err(|e| e.to_string())
         }
+        "reindex" => store::reindex(&store_cfg).map(|n| log_info!("reindexed {n} torrents")).map_err(|e| e.to_string()),
         "help" | "-h" => {
             print!("{USAGE}");
             Ok(())
@@ -154,6 +167,7 @@ fn main() {
 }
 
 fn run(opts: &Options, store_cfg: StoreConfig, crawl: bool) -> Result<(), String> {
+    store::upgrade(&store_cfg).map_err(|e| format!("upgrading {}: {e}", store_cfg.path.display()))?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(std::thread::available_parallelism().map_or(2, |n| n.get().min(4)))
         .max_blocking_threads(16)

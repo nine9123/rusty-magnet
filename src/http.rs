@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 
 use crate::classify::{self, ContentType};
 use crate::crawler::CrawlerStats;
-use crate::store::{Query, Reader, Row, Sort};
+use crate::store::{self, Query, Reader, Row, Sort};
 use crate::torrent::{self, File};
 use crate::{log_debug, log_info};
 
@@ -106,6 +106,7 @@ async fn handle_conn(mut stream: TcpStream, _peer: SocketAddr, state: Arc<AppSta
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     let header = format!(
@@ -185,6 +186,9 @@ async fn blocking(
 ) -> Response {
     match tokio::task::spawn_blocking(move || f(&state)).await {
         Ok(Ok(r)) => r,
+        Ok(Err(e)) if store::is_timeout(&e) => {
+            Response::error(503, "the search took too long: add more words or filters")
+        }
         Ok(Err(e)) => {
             log_info!("http: database error: {e}");
             Response::error(500, "database error")

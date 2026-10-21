@@ -41,14 +41,11 @@ CREATE TABLE IF NOT EXISTS torrents (
     discovered_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS torrents_type_id ON torrents(content_type, id);
+CREATE INDEX IF NOT EXISTS torrents_size ON torrents(size);
+CREATE INDEX IF NOT EXISTS torrents_peers ON torrents(peers, id);
 CREATE TABLE IF NOT EXISTS torrent_files (
     torrent_id INTEGER PRIMARY KEY,
     data       BLOB NOT NULL
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS torrents_fts USING fts5(
-    name, files,
-    content='', contentless_delete=1,
-    tokenize='unicode61 remove_diacritics 2'
 );
 CREATE TABLE IF NOT EXISTS type_counts (
     content_type INTEGER PRIMARY KEY,  -- 0 = unknown
@@ -63,6 +60,8 @@ pub struct StoreConfig {
     pub cache_mb: u32,
     /// Index file names (not just torrent names) for full-text search.
     pub index_files: bool,
+    /// Reader queries running longer are interrupted; `None` = no limit.
+    pub query_timeout: Option<Duration>,
 }
 
 fn configure(conn: &Connection, cfg: &StoreConfig) -> Result<()> {
@@ -80,8 +79,137 @@ fn configure(conn: &Connection, cfg: &StoreConfig) -> Result<()> {
 pub fn open_rw(cfg: &StoreConfig) -> Result<Connection> {
     let conn = Connection::open(&cfg.path)?;
     configure(&conn, cfg)?;
+    if table_exists(&conn, "torrents")?
+        && !(table_exists(&conn, "torrents_size")? && table_exists(&conn, "torrents_peers")?)
+    {
+        crate::log_info!("db: building the size and peers sort indexes (a few minutes on a large database)");
+    }
     conn.execute_batch(SCHEMA)?;
+    if !table_exists(&conn, "torrents_fts")? {
+        create_fts(&conn, "torrents_fts")?;
+    }
     Ok(conn)
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = ?1)", [name], |r| r.get(0))
+}
+
+/// The search index. `tags` holds filter tokens (see `fts_tags`) so that type,
+/// year, resolution and season filters run inside the index; it has no weight
+/// in relevance ranking.
+fn create_fts(conn: &Connection, table: &str) -> Result<()> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE {table} USING fts5(
+            name, files, tags,
+            content='', contentless_delete=1,
+            tokenize='unicode61 remove_diacritics 2'
+         );
+         INSERT INTO {table} ({table}, rank) VALUES ('rank', 'bm25(1.0, 1.0, 0.0)');"
+    ))
+}
+
+/// Databases created before the `tags` column have a two-column search index
+/// until `reindex` rebuilds it. Everything still works on them, filters just
+/// run outside the index.
+fn fts_has_tags(conn: &Connection) -> Result<bool> {
+    Ok(conn.prepare("SELECT * FROM torrents_fts LIMIT 0")?.column_count() >= 3)
+}
+
+/// Filter tokens for the `tags` column: `ct<type id>` (`ct0` = unknown),
+/// `y<year>`, `r<resolution>`, `s<season>`.
+fn fts_tags(content_type: Option<i64>, year: Option<i64>, resolution: Option<&str>, season: Option<i64>) -> String {
+    let mut s = format!("ct{}", content_type.unwrap_or(0));
+    if let Some(y) = year {
+        s.push_str(&format!(" y{y}"));
+    }
+    if let Some(r) = resolution {
+        s.push_str(&format!(" r{r}"));
+    }
+    if let Some(n) = season {
+        s.push_str(&format!(" s{n}"));
+    }
+    s
+}
+
+/// Databases up to this many torrents get their search index rebuilt at
+/// start-up (well under a minute); larger ones need an explicit `reindex`.
+const AUTO_REINDEX_MAX: u64 = 1_000_000;
+
+/// Brings an older database up to date before it is served.
+pub fn upgrade(cfg: &StoreConfig) -> Result<()> {
+    let conn = open_rw(cfg)?;
+    if fts_has_tags(&conn)? {
+        return Ok(());
+    }
+    let n = conn.query_row("SELECT coalesce(sum(n), 0) FROM type_counts", [], |r| r.get::<_, i64>(0))? as u64;
+    drop(conn);
+    if n <= AUTO_REINDEX_MAX {
+        crate::log_info!("db: rebuilding the search index with filter tags ({n} torrents)");
+        reindex(cfg)?;
+    } else {
+        crate::log_warn!(
+            "db: the search index has no filter tags yet, so filtered searches stay slow on {n} torrents. \
+             Stop rustymagnet and run `rustymagnet reindex` once (see docs/scaling.md)"
+        );
+    }
+    Ok(())
+}
+
+/// Rebuilds the search index from the stored names and file lists, into a new
+/// table that replaces the old one at the end. Run it with nothing else
+/// writing to the database. Needs free disk space for a second copy of the index.
+pub fn reindex(cfg: &StoreConfig) -> Result<u64> {
+    let mut conn = open_rw(cfg)?;
+    conn.execute_batch("DROP TABLE IF EXISTS torrents_fts_new;")?;
+    create_fts(&conn, "torrents_fts_new")?;
+    let mut last_id = 0i64;
+    let mut total = 0u64;
+    loop {
+        let tx = conn.transaction()?;
+        type ReindexRow = (i64, String, Option<Vec<u8>>, Option<i64>, Option<i64>, Option<String>, Option<i64>);
+        let rows: Vec<ReindexRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT t.id, t.name, f.data, t.content_type, t.year, t.resolution, t.season
+                 FROM torrents t LEFT JOIN torrent_files f ON f.torrent_id = t.id
+                 WHERE t.id > ?1 ORDER BY t.id LIMIT 10000",
+            )?;
+            let rows = stmt.query_map([last_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            })?;
+            rows.collect::<Result<_>>()?
+        };
+        let Some(last) = rows.last() else {
+            tx.commit()?;
+            break;
+        };
+        last_id = last.0;
+        {
+            let mut ins =
+                tx.prepare_cached("INSERT INTO torrents_fts_new (rowid, name, files, tags) VALUES (?1, ?2, ?3, ?4)")?;
+            for (id, name, data, ct, year, res, season) in &rows {
+                // Only multi-file torrents have a file list, as in `insert`.
+                let files = match data {
+                    Some(d) if cfg.index_files => files_fts_text(&torrent::decode_files(d)),
+                    _ => String::new(),
+                };
+                ins.execute(params![id, name, files, fts_tags(*ct, *year, res.as_deref(), *season)])?;
+            }
+        }
+        tx.commit()?;
+        let before = total;
+        total += rows.len() as u64;
+        if before / 100_000 != total / 100_000 {
+            crate::log_info!("reindex: {} torrents processed", total);
+        }
+    }
+    conn.execute_batch(
+        "BEGIN;
+         DROP TABLE torrents_fts;
+         ALTER TABLE torrents_fts_new RENAME TO torrents_fts;
+         COMMIT;",
+    )?;
+    Ok(total)
 }
 
 pub struct NewTorrent {
@@ -117,8 +245,9 @@ fn join(v: &[&str]) -> Option<String> {
     (!v.is_empty()).then(|| v.join(","))
 }
 
-/// Inserts one torrent; returns false if it already existed.
-fn insert(tx: &rusqlite::Transaction<'_>, t: &NewTorrent, index_files: bool) -> Result<bool> {
+/// Inserts one torrent; returns false if it already existed. `tags` says
+/// whether the search index has the `tags` column.
+fn insert(tx: &rusqlite::Transaction<'_>, t: &NewTorrent, index_files: bool, tags: bool) -> Result<bool> {
     let c = &t.class;
     if c.banned {
         return Ok(false);
@@ -159,11 +288,18 @@ fn insert(tx: &rusqlite::Transaction<'_>, t: &NewTorrent, index_files: bool) -> 
             .execute(params![id, torrent::encode_files(&t.info.files)])?;
     }
     let files_text = if index_files && multi { files_fts_text(&t.info.files) } else { String::new() };
-    tx.prepare_cached("INSERT INTO torrents_fts (rowid, name, files) VALUES (?1, ?2, ?3)")?.execute(params![
-        id,
-        t.info.name,
-        files_text
-    ])?;
+    if tags {
+        let tags =
+            fts_tags(c.content_type.map(ContentType::id), c.year.map(i64::from), c.resolution, c.season.map(i64::from));
+        tx.prepare_cached("INSERT INTO torrents_fts (rowid, name, files, tags) VALUES (?1, ?2, ?3, ?4)")?
+            .execute(params![id, t.info.name, files_text, tags])?;
+    } else {
+        tx.prepare_cached("INSERT INTO torrents_fts (rowid, name, files) VALUES (?1, ?2, ?3)")?.execute(params![
+            id,
+            t.info.name,
+            files_text
+        ])?;
+    }
     tx.prepare_cached(
         "INSERT INTO type_counts (content_type, n) VALUES (?1, 1) ON CONFLICT(content_type) DO UPDATE SET n = n + 1",
     )?
@@ -187,15 +323,16 @@ pub fn spawn_writer(
     stats: Arc<WriterStats>,
 ) -> Result<(SyncSender<WriteMsg>, std::thread::JoinHandle<()>)> {
     let mut conn = open_rw(&cfg)?;
+    let tags = fts_has_tags(&conn)?;
     let (tx, rx) = std::sync::mpsc::sync_channel::<WriteMsg>(4096);
     let handle = std::thread::Builder::new()
         .name("db-writer".into())
-        .spawn(move || writer_loop(&mut conn, rx, &cfg, &stats))
+        .spawn(move || writer_loop(&mut conn, rx, &cfg, tags, &stats))
         .expect("spawn writer thread");
     Ok((tx, handle))
 }
 
-fn writer_loop(conn: &mut Connection, rx: Receiver<WriteMsg>, cfg: &StoreConfig, stats: &WriterStats) {
+fn writer_loop(conn: &mut Connection, rx: Receiver<WriteMsg>, cfg: &StoreConfig, tags: bool, stats: &WriterStats) {
     const BATCH: usize = 1000;
     const MAX_DELAY: Duration = Duration::from_millis(1000);
     let mut pending: Vec<Box<NewTorrent>> = Vec::with_capacity(BATCH);
@@ -215,7 +352,7 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteMsg>, cfg: &StoreConfig,
             }
         }
         if !pending.is_empty() {
-            match write_batch(conn, &pending, cfg.index_files) {
+            match write_batch(conn, &pending, cfg.index_files, tags) {
                 Ok(n) => {
                     stats.inserted.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                     crate::log_debug!("db: committed {} new torrents", n);
@@ -228,11 +365,11 @@ fn writer_loop(conn: &mut Connection, rx: Receiver<WriteMsg>, cfg: &StoreConfig,
     let _ = conn.execute_batch("PRAGMA optimize;");
 }
 
-fn write_batch(conn: &mut Connection, batch: &[Box<NewTorrent>], index_files: bool) -> Result<u64> {
+fn write_batch(conn: &mut Connection, batch: &[Box<NewTorrent>], index_files: bool, tags: bool) -> Result<u64> {
     let tx = conn.transaction()?;
     let mut n = 0;
     for t in batch {
-        if insert(&tx, t, index_files)? {
+        if insert(&tx, t, index_files, tags)? {
             n += 1;
         }
     }
@@ -265,16 +402,22 @@ pub fn count_torrents(cfg: &StoreConfig) -> Result<u64> {
 /// Torrents that now match the blocklist are deleted.
 pub fn reclassify(cfg: &StoreConfig) -> Result<u64> {
     let mut conn = open_rw(cfg)?;
+    let tags = fts_has_tags(&conn)?;
     let mut last_id = 0i64;
     let mut total = 0u64;
     loop {
         let tx = conn.transaction()?;
-        let rows: Vec<(i64, String, Option<Vec<u8>>, i64)> = {
+        type ReclassifyRow = (i64, String, Option<Vec<u8>>, i64, String);
+        let rows: Vec<ReclassifyRow> = {
             let mut stmt = tx.prepare(
-                "SELECT t.id, t.name, f.data, t.size FROM torrents t LEFT JOIN torrent_files f ON f.torrent_id = t.id
+                "SELECT t.id, t.name, f.data, t.size, t.content_type, t.year, t.resolution, t.season
+                 FROM torrents t LEFT JOIN torrent_files f ON f.torrent_id = t.id
                  WHERE t.id > ?1 ORDER BY t.id LIMIT 5000",
             )?;
-            let rows = stmt.query_map([last_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let rows = stmt.query_map([last_id], |r| {
+                let old_tags = fts_tags(r.get(4)?, r.get(5)?, r.get::<_, Option<String>>(6)?.as_deref(), r.get(7)?);
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, old_tags))
+            })?;
             rows.collect::<Result<_>>()?
         };
         if rows.is_empty() {
@@ -286,7 +429,7 @@ pub fn reclassify(cfg: &StoreConfig) -> Result<u64> {
                 "UPDATE torrents SET content_type=?2, title=?3, year=?4, season=?5, episodes=?6, resolution=?7,
                  source=?8, video_codec=?9, modifiers=?10, languages=?11, release_group=?12 WHERE id=?1",
             )?;
-            for (id, name, data, size) in &rows {
+            for (id, name, data, size, old_tags) in &rows {
                 let files = match data {
                     Some(d) => torrent::decode_files(d),
                     None => vec![File { path: name.clone(), size: *size as u64 }],
@@ -297,6 +440,19 @@ pub fn reclassify(cfg: &StoreConfig) -> Result<u64> {
                     tx.execute("DELETE FROM torrent_files WHERE torrent_id = ?1", [id])?;
                     tx.execute("DELETE FROM torrents WHERE id = ?1", [id])?;
                     continue;
+                }
+                let new_tags = fts_tags(
+                    c.content_type.map(ContentType::id),
+                    c.year.map(i64::from),
+                    c.resolution,
+                    c.season.map(i64::from),
+                );
+                if tags && new_tags != *old_tags {
+                    // A contentless index row can only be replaced as a whole.
+                    let files_text =
+                        if cfg.index_files && data.is_some() { files_fts_text(&files) } else { String::new() };
+                    tx.prepare_cached("UPDATE torrents_fts SET name = ?2, files = ?3, tags = ?4 WHERE rowid = ?1")?
+                        .execute(params![id, name, files_text, new_tags])?;
                 }
                 upd.execute(params![
                     id,
@@ -433,6 +589,9 @@ pub struct SearchResult {
     pub total_capped: bool,
 }
 
+/// Characters needed before `*` for a prefix search.
+pub const MIN_PREFIX: usize = 3;
+
 /// Turns user input into a safe FTS5 expression: every word is quoted and
 /// AND-ed, `-word` excludes, `word*` is a prefix match.
 pub fn fts_query(input: &str) -> Option<String> {
@@ -443,12 +602,14 @@ pub fn fts_query(input: &str) -> Option<String> {
             Some(r) if !r.is_empty() => (true, r),
             _ => (false, raw),
         };
-        let prefix = raw.ends_with('*');
-        let words: Vec<String> =
-            raw.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| format!("\"{}\"", w)).collect();
-        if words.is_empty() {
+        let parts: Vec<&str> = raw.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+        let Some(last) = parts.last() else {
             continue;
-        }
+        };
+        // A short prefix like `ab*` expands to a large part of the vocabulary;
+        // it is searched as a plain word instead.
+        let prefix = raw.ends_with('*') && last.chars().count() >= MIN_PREFIX;
+        let words: Vec<String> = parts.iter().map(|w| format!("\"{}\"", w)).collect();
         // "s01e02" or "x.y.z" stay together as a phrase.
         let mut term = if words.len() > 1 { words.join(" + ") } else { words[0].clone() };
         if prefix {
@@ -470,22 +631,158 @@ pub fn fts_query(input: &str) -> Option<String> {
     Some(q)
 }
 
+/// SQLite's heap is capped at the page caches' budget plus this much, so that
+/// a pathological query fails instead of growing the container.
+const HEAP_HEADROOM_MB: u64 = 256;
+
+/// Whether a query was stopped after `StoreConfig::query_timeout`.
+pub fn is_timeout(e: &rusqlite::Error) -> bool {
+    e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+}
+
+/// One search filter: an SQL condition on `torrents t` and, where the search
+/// index can answer it, the same condition as an FTS expression on `tags`.
+struct Filter {
+    sql: String,
+    args: Vec<SqlValue>,
+    tag: Option<String>,
+}
+
+fn filters(q: &Query) -> Vec<Filter> {
+    let mut out = Vec::new();
+    let mut add = |sql: &str, args: Vec<SqlValue>, tag: Option<String>| out.push(Filter { sql: sql.into(), args, tag });
+    if !q.types.is_empty() {
+        let mut parts = Vec::new();
+        let ids: Vec<String> = q.types.iter().flatten().map(|t| t.id().to_string()).collect();
+        if !ids.is_empty() {
+            parts.push(format!("t.content_type IN ({})", ids.join(",")));
+        }
+        if q.types.contains(&None) {
+            parts.push("t.content_type IS NULL".to_string());
+        }
+        let tags: Vec<String> = q.types.iter().map(|t| format!("\"ct{}\"", t.map_or(0, ContentType::id))).collect();
+        add(&format!("({})", parts.join(" OR ")), vec![], Some(format!("tags : ({})", tags.join(" OR "))));
+    }
+    if let Some(y) = q.year {
+        add("t.year = ?", vec![SqlValue::Integer(y.into())], Some(format!("tags : \"y{y}\"")));
+    }
+    if let Some(r) = &q.resolution {
+        // Stored resolutions are tokens like `1080p`; anything else can only be compared in SQL.
+        let tag = (!r.is_empty() && r.chars().all(|c| c.is_ascii_alphanumeric())).then(|| format!("tags : \"r{r}\""));
+        add("t.resolution = ?", vec![SqlValue::Text(r.clone())], tag);
+    }
+    if let Some(s) = q.season {
+        add("t.season = ?", vec![SqlValue::Integer(s.into())], Some(format!("tags : \"s{s}\"")));
+        if let Some(e) = q.episode {
+            // Exact episode, a range, or a full-season pack.
+            add(
+                "(t.episodes = ? OR t.episodes NOT LIKE '%E%' OR t.episodes LIKE '%-E%')",
+                vec![SqlValue::Text(format!("S{s:02}E{e:02}"))],
+                None,
+            );
+        }
+    }
+    if let Some(m) = q.min_size {
+        add("t.size >= ?", vec![SqlValue::Integer(m as i64)], None);
+    }
+    if let Some(m) = q.max_size {
+        add("t.size <= ?", vec![SqlValue::Integer(m as i64)], None);
+    }
+    out
+}
+
+/// Joins the filters' SQL with AND, numbering placeholders from `?{first}`.
+/// `no_type_index` keeps SQLite from filtering by the type index, so that it
+/// walks a sort index instead of sorting every torrent of that type.
+fn render(filters: &[&Filter], first: usize, no_type_index: bool) -> (String, Vec<SqlValue>) {
+    let mut n = first;
+    let mut conds = Vec::new();
+    let mut args = Vec::new();
+    for f in filters {
+        let mut sql = String::new();
+        for c in f.sql.chars() {
+            if c == '?' {
+                sql.push_str(&format!("?{n}"));
+                n += 1;
+            } else {
+                sql.push(c);
+            }
+        }
+        if no_type_index {
+            sql = sql.replace("t.content_type", "+t.content_type");
+        }
+        conds.push(sql);
+        args.extend(f.args.iter().cloned());
+    }
+    (conds.join(" AND "), args)
+}
+
+/// Lets the watchdog thread interrupt a connection whose query has run past
+/// its deadline.
+struct Watch {
+    deadline: Mutex<Option<Instant>>,
+    interrupt: rusqlite::InterruptHandle,
+}
+
+struct Pooled {
+    conn: Connection,
+    watch: Arc<Watch>,
+}
+
+type Watches = Mutex<Vec<std::sync::Weak<Watch>>>;
+
+/// Interrupts reader queries past their deadline; exits once the `Reader` is gone.
+fn watchdog(watches: std::sync::Weak<Watches>) {
+    while let Some(list) = watches.upgrade() {
+        let now = Instant::now();
+        list.lock().unwrap().retain(|w| {
+            let Some(w) = w.upgrade() else {
+                return false;
+            };
+            // The lock keeps the query from finishing and the connection from
+            // starting its next query between the check and the interrupt.
+            let deadline = w.deadline.lock().unwrap();
+            if deadline.is_some_and(|d| now >= d) {
+                w.interrupt.interrupt();
+            }
+            true
+        });
+        drop(list);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub struct Reader {
     cfg: StoreConfig,
-    pool: Mutex<Vec<Connection>>,
+    /// The search index has the `tags` column.
+    tags: bool,
+    timeout: Option<Duration>,
+    pool: Mutex<Vec<Pooled>>,
+    watches: Arc<Watches>,
 }
 
 impl Reader {
     pub fn new(cfg: StoreConfig) -> Result<Self> {
         // Ensure the schema exists before read-only connections are opened.
-        drop(open_rw(&cfg)?);
-        Ok(Reader { cfg, pool: Mutex::new(Vec::new()) })
+        let conn = open_rw(&cfg)?;
+        let tags = fts_has_tags(&conn)?;
+        // Process-wide: the writer's page cache, up to 4 readers at half of it, and headroom.
+        let limit_mb = u64::from(cfg.cache_mb.max(2)) * 3 + HEAP_HEADROOM_MB;
+        conn.execute_batch(&format!("PRAGMA hard_heap_limit={};", limit_mb << 20))?;
+        drop(conn);
+        let watches = Arc::new(Watches::default());
+        let w = Arc::downgrade(&watches);
+        std::thread::Builder::new()
+            .name("db-watchdog".into())
+            .spawn(move || watchdog(w))
+            .expect("spawn watchdog thread");
+        Ok(Reader { timeout: cfg.query_timeout, cfg, tags, pool: Mutex::new(Vec::new()), watches })
     }
 
     fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.pool.lock().unwrap().pop();
-        let conn = match conn {
-            Some(c) => c,
+        let p = self.pool.lock().unwrap().pop();
+        let p = match p {
+            Some(p) => p,
             None => {
                 let c = Connection::open_with_flags(
                     &self.cfg.path,
@@ -496,115 +793,128 @@ impl Reader {
                     "PRAGMA cache_size=-{}; PRAGMA mmap_size=268435456; PRAGMA temp_store=MEMORY;",
                     u64::from(self.cfg.cache_mb.max(2)) * 1024 / 2
                 ))?;
-                c
+                let watch = Arc::new(Watch { deadline: Mutex::new(None), interrupt: c.get_interrupt_handle() });
+                self.watches.lock().unwrap().push(Arc::downgrade(&watch));
+                Pooled { conn: c, watch }
             }
         };
-        let out = f(&conn);
+        *p.watch.deadline.lock().unwrap() = self.timeout.map(|t| Instant::now() + t);
+        let out = f(&p.conn);
+        *p.watch.deadline.lock().unwrap() = None;
         let mut pool = self.pool.lock().unwrap();
         if pool.len() < 4 {
-            pool.push(conn);
+            pool.push(p);
         }
         out
     }
 
     pub fn search(&self, q: &Query) -> Result<SearchResult> {
-        let fts = fts_query(&q.text);
-        let mut wh: Vec<String> = Vec::new();
-        let mut args: Vec<SqlValue> = Vec::new();
-        if let Some(f) = &fts {
-            args.push(SqlValue::Text(f.clone()));
-            wh.push(format!("torrents_fts MATCH ?{}", args.len()));
-        }
-        if !q.types.is_empty() {
-            let mut parts = Vec::new();
-            let ids: Vec<String> = q.types.iter().flatten().map(|t| t.id().to_string()).collect();
-            if !ids.is_empty() {
-                parts.push(format!("t.content_type IN ({})", ids.join(",")));
-            }
-            if q.types.contains(&None) {
-                parts.push("t.content_type IS NULL".to_string());
-            }
-            wh.push(format!("({})", parts.join(" OR ")));
-        }
-        let push = |cond: &str, v: SqlValue, args: &mut Vec<SqlValue>, wh: &mut Vec<String>| {
-            args.push(v);
-            wh.push(cond.replace('?', &format!("?{}", args.len())));
-        };
-        if let Some(y) = q.year {
-            push("t.year = ?", SqlValue::Integer(y.into()), &mut args, &mut wh);
-        }
-        if let Some(r) = &q.resolution {
-            push("t.resolution = ?", SqlValue::Text(r.clone()), &mut args, &mut wh);
-        }
-        if let Some(s) = q.season {
-            push("t.season = ?", SqlValue::Integer(s.into()), &mut args, &mut wh);
-            if let Some(e) = q.episode {
-                // Exact episode, a range, or a full-season pack.
-                push(
-                    "(t.episodes = ? OR t.episodes NOT LIKE '%E%' OR t.episodes LIKE '%-E%')",
-                    SqlValue::Text(format!("S{s:02}E{e:02}")),
-                    &mut args,
-                    &mut wh,
-                );
-            }
-        }
-        if let Some(m) = q.min_size {
-            push("t.size >= ?", SqlValue::Integer(m as i64), &mut args, &mut wh);
-        }
-        if let Some(m) = q.max_size {
-            push("t.size <= ?", SqlValue::Integer(m as i64), &mut args, &mut wh);
-        }
-        let from = if fts.is_some() { "torrents_fts f JOIN torrents t ON t.id = f.rowid" } else { "torrents t" };
-        let where_sql = if wh.is_empty() { String::new() } else { format!("WHERE {}", wh.join(" AND ")) };
-        let order = match (q.sort, fts.is_some()) {
-            (Sort::Relevance, true) => "f.rank",
-            (Sort::Relevance | Sort::Newest, false) => "t.id DESC",
-            (Sort::Newest, true) => "f.rowid DESC",
-            (Sort::Oldest, _) => "t.id ASC",
-            (Sort::Largest, _) => "t.size DESC",
-            (Sort::Smallest, _) => "t.size ASC",
-            (Sort::Peers, _) => "t.peers DESC, t.id DESC",
-        };
-        let limit = q.limit.clamp(1, 500);
-        // Text-only search ordered by an FTS column: rank, page and count inside
-        // the FTS index and only look up the `torrents` rows that are returned,
-        // instead of one (often uncached) row per match.
-        let fts_only = fts.is_some() && wh.len() == 1;
-        let fts_order = match q.sort {
+        let text = fts_query(&q.text);
+        // Without text there is nothing to rank.
+        let sort = if text.is_none() && q.sort == Sort::Relevance { Sort::Newest } else { q.sort };
+        let by_column = matches!(sort, Sort::Largest | Sort::Smallest | Sort::Peers);
+        let filters = filters(q);
+        let unfiltered = text.is_none() && filters.is_empty();
+        let (tagged, residual): (Vec<&Filter>, Vec<&Filter>) =
+            filters.iter().partition(|f| self.tags && f.tag.is_some());
+        // Text never matches the filter tokens.
+        let mut terms: Vec<String> = text.iter().map(|t| format!("{{name files}} : ({t})")).collect();
+        terms.extend(tagged.iter().filter_map(|f| f.tag.clone()));
+        let matched = (!terms.is_empty()).then(|| terms.join(" AND "));
+        let page = format!("LIMIT {} OFFSET {}", q.limit.clamp(1, 500), q.offset);
+        let fts_order = match sort {
             // Newest first among equal ranks, so pages don't overlap or skip.
             Sort::Relevance => Some(("rank, rowid DESC", "f.rank, t.id DESC")),
             Sort::Newest => Some(("rowid DESC", "t.id DESC")),
             Sort::Oldest => Some(("rowid ASC", "t.id ASC")),
             _ => None,
         };
-        let (sql, count_sql) = match fts_order.filter(|_| fts_only) {
-            Some((inner, outer)) => (
-                format!(
-                    "SELECT {ROW_COLS} FROM (SELECT rowid, rank FROM {} ORDER BY {inner} LIMIT {limit} OFFSET {}) f
-                     JOIN torrents t ON t.id = f.rowid ORDER BY {outer}",
-                    if q.sort == Sort::Relevance {
-                        // bm25 costs a little per match; very common words would
-                        // otherwise score millions of rows. Rank the newest ones.
-                        format!(
-                            "(SELECT rowid, rank FROM torrents_fts WHERE torrents_fts MATCH ?1
-                             ORDER BY rowid DESC LIMIT {RANK_WINDOW})"
-                        )
-                    } else {
-                        "torrents_fts WHERE torrents_fts MATCH ?1".to_string()
-                    },
-                    q.offset
-                ),
-                format!(
-                    "SELECT count(*) FROM (SELECT 1 FROM torrents_fts WHERE torrents_fts MATCH ?1 LIMIT {})",
-                    COUNT_CAP + 1
-                ),
-            ),
-            None => (
-                format!("SELECT {ROW_COLS} FROM {from} {where_sql} ORDER BY {order} LIMIT {limit} OFFSET {}", q.offset),
-                format!("SELECT count(*) FROM (SELECT 1 FROM {from} {where_sql} LIMIT {})", COUNT_CAP + 1),
-            ),
+        let fts_count = format!(
+            "SELECT count(*) FROM (SELECT 1 FROM torrents_fts WHERE torrents_fts MATCH ?1 LIMIT {})",
+            COUNT_CAP + 1
+        );
+        let count_of =
+            |from_where: &str| format!("SELECT count(*) FROM (SELECT 1 FROM {from_where} LIMIT {})", COUNT_CAP + 1);
+        let (sql, args, count_sql, count_args) = match &matched {
+            // Every condition is in the search index: rank, page and count there
+            // and only look up the `torrents` rows that are returned, instead of
+            // one (often uncached) row per match.
+            Some(m) if residual.is_empty() && fts_order.is_some() => {
+                let (inner, outer) = fts_order.unwrap_or_default();
+                let source = if sort == Sort::Relevance {
+                    // bm25 costs a little per match; very common words would
+                    // otherwise score millions of rows. Rank the newest ones.
+                    format!(
+                        "(SELECT rowid, rank FROM torrents_fts WHERE torrents_fts MATCH ?1
+                         ORDER BY rowid DESC LIMIT {RANK_WINDOW})"
+                    )
+                } else {
+                    "torrents_fts WHERE torrents_fts MATCH ?1".to_string()
+                };
+                let sql = format!(
+                    "SELECT {ROW_COLS} FROM (SELECT rowid, rank FROM {source} ORDER BY {inner} {page}) f
+                     JOIN torrents t ON t.id = f.rowid ORDER BY {outer}"
+                );
+                let args = vec![SqlValue::Text(m.clone())];
+                (sql, args.clone(), fts_count, args)
+            }
+            // Text sorted by size or peers: an index on the column doesn't help
+            // with a text match, so sort the newest matches, as for relevance.
+            Some(m) if residual.is_empty() && text.is_some() => {
+                let col = match sort {
+                    Sort::Largest => "t.size DESC",
+                    Sort::Smallest => "t.size ASC",
+                    _ => "t.peers DESC",
+                };
+                let sql = format!(
+                    "SELECT {ROW_COLS} FROM (SELECT rowid FROM torrents_fts WHERE torrents_fts MATCH ?1
+                     ORDER BY rowid DESC LIMIT {RANK_WINDOW}) f
+                     JOIN torrents t ON t.id = f.rowid ORDER BY {col}, t.id DESC {page}"
+                );
+                let args = vec![SqlValue::Text(m.clone())];
+                (sql, args.clone(), fts_count, args)
+            }
+            // Some conditions can only be checked on the rows.
+            Some(m) if text.is_some() || !by_column => {
+                let (conds, mut args) = render(&residual, 2, false);
+                args.insert(0, SqlValue::Text(m.clone()));
+                let from_where =
+                    format!("torrents_fts f JOIN torrents t ON t.id = f.rowid WHERE torrents_fts MATCH ?1 AND {conds}");
+                let order = match sort {
+                    Sort::Relevance => "f.rank",
+                    Sort::Newest => "f.rowid DESC",
+                    Sort::Oldest => "t.id ASC",
+                    Sort::Largest => "t.size DESC",
+                    Sort::Smallest => "t.size ASC",
+                    Sort::Peers => "t.peers DESC, t.id DESC",
+                };
+                let sql = format!("SELECT {ROW_COLS} FROM {from_where} ORDER BY {order} {page}");
+                (sql, args.clone(), count_of(&from_where), args)
+            }
+            // No text: walk the table in sort order and check the filters.
+            _ => {
+                let all: Vec<&Filter> = filters.iter().collect();
+                let (conds, args) = render(&all, 1, by_column);
+                let wh = if conds.is_empty() { String::new() } else { format!("WHERE {conds}") };
+                let order = match sort {
+                    Sort::Relevance | Sort::Newest => "t.id DESC",
+                    Sort::Oldest => "t.id ASC",
+                    Sort::Largest => "t.size DESC",
+                    Sort::Smallest => "t.size ASC",
+                    Sort::Peers => "t.peers DESC, t.id DESC",
+                };
+                let sql = format!("SELECT {ROW_COLS} FROM torrents t {wh} ORDER BY {order} {page}");
+                match &matched {
+                    // Filter-only counts are cheap in the index, a table scan otherwise.
+                    Some(m) if residual.is_empty() => (sql, args, fts_count, vec![SqlValue::Text(m.clone())]),
+                    _ => {
+                        let (conds, count_args) = render(&all, 1, false);
+                        let wh = if conds.is_empty() { String::new() } else { format!("WHERE {conds}") };
+                        (sql, args, count_of(&format!("torrents t {wh}")), count_args)
+                    }
+                }
+            }
         };
-        let unfiltered = fts.is_none() && wh.is_empty();
         self.with_conn(|c| {
             let rows = c
                 .prepare_cached(&sql)?
@@ -613,7 +923,8 @@ impl Reader {
             let total = if unfiltered {
                 c.query_row("SELECT coalesce(sum(n), 0) FROM type_counts", [], |r| r.get::<_, i64>(0))? as u64
             } else {
-                c.prepare_cached(&count_sql)?.query_row(params_from_iter(args.iter()), |r| r.get::<_, i64>(0))? as u64
+                c.prepare_cached(&count_sql)?.query_row(params_from_iter(count_args.iter()), |r| r.get::<_, i64>(0))?
+                    as u64
             };
             let capped = !unfiltered && total > COUNT_CAP;
             Ok(SearchResult { rows, total: if capped { COUNT_CAP } else { total }, total_capped: capped })
@@ -668,7 +979,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rustymagnet-test-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        StoreConfig { path: dir.join("db.sqlite"), cache_mb: 8, index_files: true }
+        StoreConfig { path: dir.join("db.sqlite"), cache_mb: 8, index_files: true, query_timeout: None }
     }
 
     fn mk(i: u8, name: &str, files: &[(&str, u64)]) -> Box<NewTorrent> {
@@ -691,6 +1002,147 @@ mod tests {
         assert_eq!(fts_query("a\"b OR").unwrap(), "\"a\" + \"b\" AND \"OR\"");
         assert!(fts_query(" -x ").is_none());
         assert!(fts_query("\"\"").is_none());
+        // Prefixes need MIN_PREFIX characters, otherwise the word is matched as is.
+        assert_eq!(fts_query("ab*").unwrap(), "\"ab\"");
+        assert_eq!(fts_query("abc*").unwrap(), "\"abc\"*");
+        assert_eq!(fts_query("x.ab*").unwrap(), "\"x\" + \"ab\"");
+        assert_eq!(fts_query("ab.cdé*").unwrap(), "\"ab\" + \"cdé\"*");
+    }
+
+    fn fill(cfg: &StoreConfig) {
+        let stats = Arc::new(WriterStats::default());
+        let (tx, handle) = spawn_writer(cfg.clone(), stats).unwrap();
+        let names = [
+            "The.Matrix.1999.1080p.BluRay.x264-GRP",
+            "The.Matrix.Reloaded.2003.720p.BluRay.x264-GRP",
+            "Matrix.Documentary.1999.2160p.WEB-DL.x265-GRP",
+            "Severance.S02E03.1080p.WEB.h264-ETHEL",
+            "Severance.S02E04.1080p.WEB.h264-ETHEL",
+            "Severance.S01E01.720p.WEB.h264-ETHEL",
+            "matrix-notes",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            let i = i as u8 + 1;
+            let ext = if name.contains('.') { "mkv" } else { "txt" };
+            let file = format!("dir/{name}.{ext}");
+            tx.send(WriteMsg::Insert(mk(i, name, &[(&file, u64::from(i) << 30), ("dir/x.nfo", 1)]))).unwrap();
+        }
+        drop(tx);
+        handle.join().unwrap();
+    }
+
+    /// Names and totals for queries that cover every search path.
+    fn suite(r: &Reader) -> Vec<(Vec<String>, u64)> {
+        let base = Query { limit: 10, sort: Sort::Newest, ..Default::default() };
+        let movie = vec![Some(ContentType::Movie)];
+        let tv = vec![Some(ContentType::TvShow)];
+        let queries = [
+            Query { text: "matrix".into(), ..base.clone() },
+            Query { text: "matrix".into(), types: movie.clone(), ..base.clone() },
+            Query { text: "matrix".into(), types: vec![None], ..base.clone() },
+            Query { text: "matrix".into(), year: Some(1999), ..base.clone() },
+            Query { text: "matrix".into(), resolution: Some("1080p".into()), ..base.clone() },
+            Query { text: "matrix".into(), types: movie.clone(), sort: Sort::Largest, ..base.clone() },
+            Query { text: "matrix".into(), min_size: Some(2 << 30), ..base.clone() },
+            Query { text: "severance".into(), season: Some(2), episode: Some(3), ..base.clone() },
+            Query { types: movie.clone(), ..base.clone() },
+            Query { types: vec![Some(ContentType::Movie), None], sort: Sort::Oldest, ..base.clone() },
+            Query { year: Some(1999), ..base.clone() },
+            Query { year: Some(1999), sort: Sort::Largest, ..base.clone() },
+            Query { types: tv.clone(), season: Some(2), ..base.clone() },
+            Query { types: tv.clone(), sort: Sort::Peers, ..base.clone() },
+            Query { types: tv, resolution: Some("720p".into()), ..base.clone() },
+            Query { resolution: Some("1080p".into()), max_size: Some(4 << 30), ..base.clone() },
+            Query { sort: Sort::Smallest, ..base },
+        ];
+        queries
+            .iter()
+            .map(|q| r.search(q).map(|res| (res.rows.into_iter().map(|r| r.name).collect(), res.total)).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn filters_in_search_index() {
+        let cfg = temp_cfg("tags");
+        fill(&cfg);
+        let r = Reader::new(cfg.clone()).unwrap();
+        assert!(r.tags);
+        let got = suite(&r);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(got[0].1, 4);
+        assert_eq!(got[1].1, 3);
+        assert_eq!(got[2].0, names(&["matrix-notes"]));
+        assert_eq!(got[3].1, 2);
+        assert_eq!(got[5].0[0], "Matrix.Documentary.1999.2160p.WEB-DL.x265-GRP");
+        assert_eq!(got[7].0, names(&["Severance.S02E03.1080p.WEB.h264-ETHEL"]));
+        assert_eq!(got[12].1, 2);
+        assert_eq!(got[14].0, names(&["Severance.S01E01.720p.WEB.h264-ETHEL"]));
+        assert_eq!(got[16].1, 7);
+
+        // The same database with the search index of older versions gives the
+        // same results without tags, and again after `reindex`.
+        let legacy = temp_cfg("tags-legacy");
+        drop(open_rw(&legacy).unwrap());
+        Connection::open(&legacy.path)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE torrents_fts;
+                 CREATE VIRTUAL TABLE torrents_fts USING fts5(name, files, content='', contentless_delete=1,
+                     tokenize='unicode61 remove_diacritics 2');",
+            )
+            .unwrap();
+        fill(&legacy);
+        let old = Reader::new(legacy.clone()).unwrap();
+        assert!(!old.tags);
+        assert_eq!(suite(&old), got);
+        drop(old);
+        upgrade(&legacy).unwrap();
+        let new = Reader::new(legacy.clone()).unwrap();
+        assert!(new.tags);
+        assert_eq!(suite(&new), got);
+
+        // reclassify replaces stale tags.
+        let c = Connection::open(&cfg.path).unwrap();
+        c.execute_batch(
+            "UPDATE torrents SET content_type = 7 WHERE id = 1;
+             UPDATE torrents_fts SET name = 'The.Matrix.1999.1080p.BluRay.x264-GRP', files = '', tags = 'ct7' WHERE rowid = 1;",
+        )
+        .unwrap();
+        let games =
+            Query { text: "matrix".into(), types: vec![Some(ContentType::Game)], limit: 10, ..Default::default() };
+        assert_eq!(r.search(&games).unwrap().total, 1);
+        reclassify(&cfg).unwrap();
+        assert_eq!(r.search(&games).unwrap().total, 0);
+        assert_eq!(suite(&r), got);
+
+        for c in [cfg, legacy] {
+            let _ = std::fs::remove_dir_all(c.path.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn slow_queries_time_out() {
+        let cfg = temp_cfg("timeout");
+        let mut r = Reader::new(cfg.clone()).unwrap();
+        r.timeout = Some(Duration::from_millis(200));
+        let t0 = Instant::now();
+        let err = r
+            .with_conn(|c| {
+                c.query_row(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT count(*) FROM n",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+            })
+            .unwrap_err();
+        assert!(is_timeout(&err), "{err}");
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        // The connection is fine for the next query.
+        assert_eq!(r.with_conn(|c| c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))).unwrap(), 1);
+        // Every test store has an 8 MiB cache.
+        let limit = r.with_conn(|c| c.query_row("PRAGMA hard_heap_limit", [], |r| r.get::<_, i64>(0))).unwrap();
+        assert_eq!(limit, (8 * 3 + 256) << 20);
+        let _ = std::fs::remove_dir_all(cfg.path.parent().unwrap());
     }
 
     #[test]
@@ -924,8 +1376,9 @@ mod bench {
     fn bench_fill() {
         let path: PathBuf = std::env::var("RUSTYMAGNET_BENCH_DB").unwrap_or("/tmp/rustymagnet-bench.db".into()).into();
         let n: u64 = std::env::var("RUSTYMAGNET_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
-        let cfg = StoreConfig { path, cache_mb: 64, index_files: true };
+        let cfg = StoreConfig { path, cache_mb: 64, index_files: true, query_timeout: None };
         let mut conn = open_rw(&cfg).unwrap();
+        let tags = fts_has_tags(&conn).unwrap();
         let start: u64 =
             conn.query_row("SELECT coalesce(max(id), 0) FROM torrents", [], |r| r.get::<_, i64>(0)).unwrap() as u64;
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -940,7 +1393,7 @@ mod bench {
         while done < n {
             let batch: Vec<Box<NewTorrent>> =
                 (0..1000.min(n - done)).map(|i| torrent(&mut rng, &vocab, start + done + i)).collect();
-            write_batch(&mut conn, &batch, true).unwrap();
+            write_batch(&mut conn, &batch, true, tags).unwrap();
             done += batch.len() as u64;
             if done % 100_000 == 0 {
                 eprintln!("{done} torrents, {:.0} s", t0.elapsed().as_secs_f64());
