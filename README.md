@@ -22,6 +22,8 @@ because everything lives in one SQLite file.
   (type, year, resolution, season/episode, size) and sorting (relevance, newest, oldest,
   size, peers).
 - **Web UI** at `http://<host>:3333/`, with content-type facets, file lists and magnet links.
+  It updates live: new torrents appear at the top of the newest-first list as they are indexed,
+  and other views offer a refresh link. Click "Live" in the header to pause.
 - **Torznab API** for Sonarr / Radarr / Lidarr / Readarr / Prowlarr.
 - **JSON API**.
 - **Import** from an existing bitmagnet database.
@@ -149,6 +151,9 @@ rustymagnet does not scrape trackers, so treat it as a rough popularity signal.
 - `GET /api/search?q=&type=movie,tv_show&year=&resolution=1080p&season=&episode=&min_size=&max_size=&sort=relevance|newest|oldest|size|smallest|peers&limit=50&offset=0`
 - `GET /api/torrent/<info hash hex>` returns the torrent with its file list.
 - `GET /api/stats` returns counts per content type, database size and crawler counters.
+- `GET /api/events` is a server-sent event stream of the same stats JSON: sent within ~2 s of new
+  torrents being stored, and at least every 10 s. At most 16 streams are open at once; further
+  ones get a 503 and the web UI falls back to polling `/api/stats`.
 
 The `q` syntax: words are AND-ed, `-word` excludes a word, `word*` matches a prefix of at least
 3 characters (`ab*` searches for the word `ab`).
