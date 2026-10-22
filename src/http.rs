@@ -19,6 +19,7 @@ use crate::torrent::{self, File};
 use crate::{log_debug, log_info};
 
 const UI: &str = include_str!("ui.html");
+const FAVICON: &str = include_str!("favicon.svg");
 const MAX_REQUEST: usize = 16 * 1024;
 /// How often the stats are checked for new torrents while a UI is listening.
 const LIVE_TICK: Duration = Duration::from_secs(2);
@@ -260,6 +261,7 @@ pub fn percent_decode(s: &str) -> String {
 async fn route(path: String, params: Params, state: Arc<AppState>) -> Response {
     match path.as_str() {
         "/" | "/index.html" => Response::new(200, "text/html; charset=utf-8", UI),
+        "/favicon.svg" => Response::new(200, "image/svg+xml", FAVICON),
         "/healthz" => Response::new(200, "text/plain", "ok"),
         "/api/stats" => blocking(state, move |s| Ok(Response::json(stats_body(s).1))).await,
         "/api/search" => match build_query(&params) {
