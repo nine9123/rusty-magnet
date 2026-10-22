@@ -1,14 +1,16 @@
 //! A deliberately small HTTP/1.1 server (GET only, one request per
 //! connection) serving the web UI, a JSON API and a Torznab endpoint.
+//! `/api/events` is the one long-lived response: a server-sent event stream
+//! that keeps the web UI up to date while torrents come in.
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 
 use crate::classify::{self, ContentType};
 use crate::crawler::CrawlerStats;
@@ -18,6 +20,13 @@ use crate::{log_debug, log_info};
 
 const UI: &str = include_str!("ui.html");
 const MAX_REQUEST: usize = 16 * 1024;
+/// How often the stats are checked for new torrents while a UI is listening.
+const LIVE_TICK: Duration = Duration::from_secs(2);
+/// Stats are sent at least this often (crawler counters, keep-alive).
+const LIVE_IDLE: Duration = Duration::from_secs(10);
+/// Open event streams; more are refused and those UIs fall back to polling.
+const MAX_STREAMS: usize = 16;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct AppState {
     pub reader: Reader,
@@ -48,18 +57,32 @@ impl Response {
     }
 }
 
-pub async fn serve(listener: TcpListener, state: Arc<AppState>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+/// The latest stats JSON, shared by every `/api/events` stream.
+struct Live {
+    tx: watch::Sender<Arc<str>>,
+    streams: Arc<Semaphore>,
+    shutdown: watch::Receiver<bool>,
+}
+
+pub async fn serve(listener: TcpListener, state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     log_info!("http: listening on http://{}", listener.local_addr().map(|a| a.to_string()).unwrap_or_default());
     // Bound concurrent connections so a burst cannot exhaust the NAS.
     let conns = Arc::new(Semaphore::new(64));
+    let live = Arc::new(Live {
+        tx: watch::Sender::new(Arc::from("")),
+        streams: Arc::new(Semaphore::new(MAX_STREAMS)),
+        shutdown: shutdown.clone(),
+    });
+    tokio::spawn(publish_stats(state.clone(), live.clone()));
     loop {
         tokio::select! {
             r = listener.accept() => {
                 let Ok((stream, peer)) = r else { continue };
                 let Ok(permit) = conns.clone().try_acquire_owned() else { continue };
                 let state = state.clone();
+                let live = live.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, peer, state).await {
+                    if let Err(e) = handle_conn(stream, peer, state, live).await {
                         log_debug!("http: {peer}: {e}");
                     }
                     drop(permit);
@@ -70,7 +93,12 @@ pub async fn serve(listener: TcpListener, state: Arc<AppState>, mut shutdown: to
     }
 }
 
-async fn handle_conn(mut stream: TcpStream, _peer: SocketAddr, state: Arc<AppState>) -> std::io::Result<()> {
+async fn handle_conn(
+    mut stream: TcpStream,
+    _peer: SocketAddr,
+    state: Arc<AppState>,
+    live: Arc<Live>,
+) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(1024);
     let head_end = tokio::time::timeout(Duration::from_secs(10), async {
         let mut chunk = [0u8; 2048];
@@ -95,12 +123,17 @@ async fn handle_conn(mut stream: TcpStream, _peer: SocketAddr, state: Arc<AppSta
     let mut parts = head.lines().next().unwrap_or("").split(' ');
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     let resp = match method {
+        "GET" if target.split('?').next() == Some("/api/events") => return events(stream, state, live).await,
         "GET" | "HEAD" => {
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
             route(path.to_string(), parse_query(query), state).await
         }
         _ => Response::error(405, "method not allowed"),
     };
+    write_response(&mut stream, method, resp).await
+}
+
+async fn write_response(stream: &mut TcpStream, method: &str, resp: Response) -> std::io::Result<()> {
     let reason = match resp.status {
         200 => "OK",
         400 => "Bad Request",
@@ -121,6 +154,70 @@ async fn handle_conn(mut stream: TcpStream, _peer: SocketAddr, state: Arc<AppSta
         stream.write_all(&resp.body).await?;
     }
     stream.shutdown().await
+}
+
+/// Recomputes the stats while anyone listens and publishes them when the
+/// torrent count changed, or at least every `LIVE_IDLE`.
+async fn publish_stats(state: Arc<AppState>, live: Arc<Live>) {
+    let mut tick = tokio::time::interval(LIVE_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut shutdown = live.shutdown.clone();
+    let mut last: Option<(u64, Instant)> = None;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown.changed() => return,
+        }
+        if live.tx.receiver_count() == 0 {
+            last = None;
+            continue;
+        }
+        let s = state.clone();
+        let Ok((total, body)) = tokio::task::spawn_blocking(move || stats_body(&s)).await else { continue };
+        if last.is_none_or(|(t, at)| t != total || at.elapsed() >= LIVE_IDLE) {
+            last = Some((total, Instant::now()));
+            live.tx.send_replace(Arc::from(body));
+        }
+    }
+}
+
+/// `GET /api/events`: a `text/event-stream` of stats JSON, one `data:` line
+/// per event, starting with the current stats.
+async fn events(mut stream: TcpStream, state: Arc<AppState>, live: Arc<Live>) -> std::io::Result<()> {
+    let Ok(_permit) = live.streams.clone().try_acquire_owned() else {
+        return write_response(&mut stream, "GET", Response::error(503, "too many event streams")).await;
+    };
+    let mut rx = live.tx.subscribe();
+    rx.mark_unchanged();
+    let mut shutdown = live.shutdown.clone();
+    let first = match tokio::task::spawn_blocking(move || stats_body(&state)).await {
+        Ok((_, body)) => body,
+        Err(_) => return write_response(&mut stream, "GET", Response::error(500, "internal error")).await,
+    };
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nretry: 5000\n\n";
+    send(&mut stream, head).await?;
+    // The JSON has no raw newlines (`json_str` escapes them), so it fits one `data:` line.
+    send(&mut stream, &format!("data: {first}\n\n")).await?;
+    loop {
+        tokio::select! {
+            r = rx.changed() => {
+                if r.is_err() {
+                    break;
+                }
+                let body = rx.borrow_and_update().clone();
+                send(&mut stream, &format!("data: {body}\n\n")).await?;
+            }
+            _ = shutdown.changed() => break,
+        }
+    }
+    stream.shutdown().await
+}
+
+/// Writes to a long-lived stream; a client that stops reading is dropped.
+async fn send(stream: &mut TcpStream, s: &str) -> std::io::Result<()> {
+    tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(s.as_bytes()))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "write timeout"))?
 }
 
 pub type Params = Vec<(String, String)>;
@@ -164,7 +261,7 @@ async fn route(path: String, params: Params, state: Arc<AppState>) -> Response {
     match path.as_str() {
         "/" | "/index.html" => Response::new(200, "text/html; charset=utf-8", UI),
         "/healthz" => Response::new(200, "text/plain", "ok"),
-        "/api/stats" => blocking(state, move |s| Ok(stats_json(s))).await,
+        "/api/stats" => blocking(state, move |s| Ok(Response::json(stats_body(s).1))).await,
         "/api/search" => match build_query(&params) {
             Ok(q) => blocking(state, move |s| search_json(s, &q)).await,
             Err(e) => Response::error(400, &e),
@@ -369,11 +466,13 @@ fn files_json(out: &mut String, files: &[File]) {
     out.push(']');
 }
 
-fn stats_json(s: &AppState) -> Response {
+/// The torrent total and the `/api/stats` JSON.
+fn stats_body(s: &AppState) -> (u64, String) {
     let counts = s.reader.counts().unwrap_or_default();
+    let total = counts.iter().map(|c| c.1).sum::<u64>();
     let mut out = String::new();
     let mut o = Obj::new(&mut out);
-    o.num("torrents", counts.iter().map(|c| c.1).sum::<u64>());
+    o.num("torrents", total);
     let buf = o.key("content_types");
     let mut t = Obj::new(buf);
     for (slug, n) in &counts {
@@ -401,7 +500,7 @@ fn stats_json(s: &AppState) -> Response {
         }
     }
     o.end();
-    Response::json(out)
+    (total, out)
 }
 
 // ------------------------------------------------------------------ Torznab
@@ -612,5 +711,55 @@ mod tests {
         json_str(&mut s, "a\"b\\c\n\u{1}");
         assert_eq!(s, "\"a\\\"b\\\\c\\n\\u0001\"");
         assert_eq!(xml_escape("<a&b>"), "&lt;a&amp;b&gt;");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn event_stream_reports_new_torrents() {
+        let dir = std::env::temp_dir().join(format!("rustymagnet-test-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg =
+            store::StoreConfig { path: dir.join("db.sqlite"), cache_mb: 8, index_files: true, query_timeout: None };
+        let reader = Reader::new(cfg.clone()).unwrap();
+        let state = Arc::new(AppState { reader, crawler: None, started: Instant::now() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(serve(listener, state, shutdown_rx));
+
+        let mut conn = TcpStream::connect(addr).await.unwrap();
+        conn.write_all(b"GET /api/events HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut got = String::new();
+        let mut read_until = async |needle: &str| {
+            let mut buf = [0u8; 4096];
+            while !got.contains(needle) {
+                let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut buf)).await.unwrap().unwrap();
+                assert!(n > 0, "stream closed: {got}");
+                got.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        };
+        read_until("data: {\"torrents\":0,").await;
+
+        let (writer, handle) = store::spawn_writer(cfg, Default::default()).unwrap();
+        let files = vec![File { path: "a.mkv".into(), size: 1 }];
+        let info = torrent::TorrentInfo {
+            name: "Live.Test.2024.1080p".into(),
+            size: 1,
+            files_count: 1,
+            files,
+            private: false,
+        };
+        writer.send(store::WriteMsg::Insert(Box::new(store::NewTorrent::new([7; 20], info, 0)))).unwrap();
+        drop(writer);
+        tokio::task::spawn_blocking(move || handle.join().unwrap()).await.unwrap();
+        // Published on the next tick, well before the idle interval.
+        let t = Instant::now();
+        read_until("data: {\"torrents\":1,").await;
+        assert!(t.elapsed() < LIVE_IDLE, "took {:?}", t.elapsed());
+        assert!(got.starts_with("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream"));
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

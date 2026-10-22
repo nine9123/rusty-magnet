@@ -34,6 +34,14 @@
   .detail td { background:var(--chip); font-size:12px; }
   .files { max-height:300px; overflow:auto; font-family:ui-monospace, monospace; }
   .pager { display:flex; gap:8px; justify-content:center; padding:16px; }
+  #live { font-size:12px; color:var(--muted); cursor:pointer; user-select:none; white-space:nowrap; }
+  #live::before { content:"●"; margin-right:4px; }
+  #live.on::before { color:#16a34a; }
+  #live.off::before { content:"❚❚"; font-size:10px; }
+  #live.down::before { color:var(--muted); }
+  .meta a { cursor:pointer; margin-left:6px; }
+  @keyframes fresh { from { background:color-mix(in srgb, var(--accent) 20%, transparent); } to { background:transparent; } }
+  tr.fresh td { animation:fresh 4s ease-out; }
 </style>
 </head>
 <body>
@@ -56,6 +64,7 @@
     <button>Search</button>
   </form>
   <div class="stats" id="stats"></div>
+  <span id="live" title="Show new torrents as they are indexed (click to pause)"></span>
 </header>
 <div class="chips" id="chips"></div>
 <main>
@@ -71,6 +80,12 @@ const $ = id => document.getElementById(id);
 const LIMIT = 50;
 const LABELS = { movie:"Movies", tv_show:"TV shows", music:"Music", ebook:"E-books", comic:"Comics", audiobook:"Audiobooks", game:"Games", software:"Software", xxx:"XXX", unknown:"Unknown" };
 let state = { q:"", type:"", sort:"", res:"", offset:0 };
+let paused = localStorage.getItem("paused") === "1";
+let connected = false, polling = false;
+let seq = 0;          // drops responses to searches that a newer one replaced
+let total = null;     // torrents in the index, from the last stats
+let shownTotal = null; // ... when the results were last loaded
+let shownMeta = "";
 
 function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function size(b) { const u=["B","KB","MB","GB","TB","PB"]; let i=0; while (b>=1024 && i<u.length-1) { b/=1024; i++; } return b.toFixed(i?1:0)+" "+u[i]; }
@@ -87,39 +102,105 @@ function writeHash() {
   location.hash = p.toString();
 }
 
-async function loadStats() {
-  try {
-    const s = await (await fetch("api/stats")).json();
-    let txt = s.torrents.toLocaleString() + " torrents · " + size(s.db_bytes);
-    if (s.crawler) txt += " · " + s.crawler.nodes.toLocaleString() + " DHT nodes · " + s.crawler.fetching + " fetching";
-    $("stats").textContent = txt;
-    const chips = [`<span class="chip ${state.type?"":"on"}" data-t="">All</span>`];
-    for (const [t,n] of Object.entries(s.content_types))
-      chips.push(`<span class="chip ${state.type===t?"on":""}" data-t="${esc(t)}">${esc(LABELS[t]||t)} · ${n.toLocaleString()}</span>`);
-    $("chips").innerHTML = chips.join("");
-  } catch (e) { $("stats").textContent = "stats unavailable"; }
+function renderStats(s) {
+  let txt = s.torrents.toLocaleString() + " torrents · " + size(s.db_bytes);
+  if (s.crawler) txt += " · " + s.crawler.nodes.toLocaleString() + " DHT nodes · " + s.crawler.fetching + " fetching";
+  $("stats").textContent = txt;
+  const chips = [`<span class="chip ${state.type?"":"on"}" data-t="">All</span>`];
+  for (const [t,n] of Object.entries(s.content_types))
+    chips.push(`<span class="chip ${state.type===t?"on":""}" data-t="${esc(t)}">${esc(LABELS[t]||t)} · ${n.toLocaleString()}</span>`);
+  $("chips").innerHTML = chips.join("");
+  const grew = total !== null && s.torrents > total;
+  total = s.torrents;
+  if (shownTotal === null) shownTotal = total;
+  for (const td of document.querySelectorAll("td[data-at]")) td.textContent = ago(td.dataset.at);
+  if (!grew) return;
+  if (!paused && liveView()) search(true); else renderMeta();
 }
 
-async function search() {
+async function loadStats() {
+  try { renderStats(await (await fetch("api/stats")).json()); }
+  catch (e) { $("stats").textContent = "stats unavailable"; }
+}
+
+// New torrents only show up on their own on the first page sorted by newest;
+// other views would reshuffle under the reader, so they get a refresh link.
+function liveView() { return state.offset === 0 && (state.sort === "newest" || (!state.sort && !state.q)); }
+
+function renderMeta() {
+  const n = total - shownTotal;
+  $("meta").textContent = shownMeta;
+  if (n > 0 && (paused || !liveView())) {
+    const a = document.createElement("a");
+    a.textContent = `· ${n.toLocaleString()} new torrent${n === 1 ? "" : "s"} indexed, refresh`;
+    a.onclick = () => search();
+    $("meta").append(a);
+  }
+}
+
+function renderLive() {
+  $("live").className = paused ? "off" : connected || polling ? "on" : "down";
+  $("live").textContent = paused ? "Paused" : connected ? "Live" : polling ? "Polling" : "Reconnecting…";
+}
+
+function connect() {
+  const poll = () => { polling = true; renderLive(); loadStats(); setInterval(loadStats, 15000); };
+  if (!window.EventSource) { poll(); return; }
+  const es = new EventSource("api/events");
+  es.onopen = () => { connected = true; renderLive(); };
+  es.onmessage = e => renderStats(JSON.parse(e.data));
+  es.onerror = () => {
+    connected = false; renderLive();
+    // Closed for good (refused or not a stream): poll instead.
+    if (es.readyState === EventSource.CLOSED) poll();
+  };
+}
+
+function rowHtml(t) {
+  const tags = [t.year, t.episodes, t.resolution, t.source, t.video_codec, t.modifiers, t.languages, t.release_group].filter(Boolean)
+    .map(x => `<span class="tag">${esc(x)}</span>`).join("");
+  return `<tr class="row" data-h="${t.info_hash}"><td class="name">${esc(t.name)}<div class="tags">${tags}</div></td>
+    <td>${esc(LABELS[t.content_type]||t.content_type)}</td><td class="num">${size(t.size)}</td><td class="num">${t.files_count}</td>
+    <td class="num">${t.peers}</td><td class="num" title="${esc(t.discovered_at)}" data-at="${esc(t.discovered_at)}">${ago(t.discovered_at)}</td>
+    <td><a href="${esc(t.magnet)}" title="Magnet link" onclick="event.stopPropagation()">magnet</a></td></tr>`;
+}
+
+// quiet: a live refresh. Rows already shown are kept (with their open
+// details) and the new ones are highlighted.
+async function search(quiet) {
+  const my = ++seq;
   const p = new URLSearchParams({ limit:LIMIT, offset:state.offset });
   if (state.q) p.set("q", state.q);
   if (state.type) p.set("type", state.type);
   if (state.sort) p.set("sort", state.sort);
   if (state.res) p.set("resolution", state.res);
-  $("meta").textContent = "Searching…";
-  const r = await fetch("api/search?" + p);
-  const d = await r.json();
-  if (!r.ok) { $("meta").textContent = d.error; $("rows").innerHTML = ""; return; }
-  const total = d.total.toLocaleString() + (d.total_capped ? "+" : "");
-  $("meta").textContent = `${total} results · ${d.took_ms} ms` + (state.offset ? ` · from ${state.offset+1}` : "");
-  $("rows").innerHTML = d.results.map(t => {
-    const tags = [t.year, t.episodes, t.resolution, t.source, t.video_codec, t.modifiers, t.languages, t.release_group].filter(Boolean)
-      .map(x => `<span class="tag">${esc(x)}</span>`).join("");
-    return `<tr class="row" data-h="${t.info_hash}"><td class="name">${esc(t.name)}<div class="tags">${tags}</div></td>
-      <td>${esc(LABELS[t.content_type]||t.content_type)}</td><td class="num">${size(t.size)}</td><td class="num">${t.files_count}</td>
-      <td class="num">${t.peers}</td><td class="num" title="${esc(t.discovered_at)}">${ago(t.discovered_at)}</td>
-      <td><a href="${esc(t.magnet)}" title="Magnet link" onclick="event.stopPropagation()">magnet</a></td></tr>`;
-  }).join("");
+  if (!quiet) $("meta").textContent = "Searching…";
+  const at = total;
+  let r, d;
+  try { r = await fetch("api/search?" + p); d = await r.json(); }
+  catch (e) { if (my === seq && !quiet) $("meta").textContent = "search failed"; return; }
+  if (my !== seq) return;
+  if (!r.ok) { if (!quiet) { $("meta").textContent = d.error; $("rows").innerHTML = ""; } return; }
+  shownTotal = at ?? total;
+  const n = d.total.toLocaleString() + (d.total_capped ? "+" : "");
+  shownMeta = `${n} results · ${d.took_ms} ms` + (state.offset ? ` · from ${state.offset+1}` : "");
+  renderMeta();
+  if (quiet) {
+    const old = new Map([...$("rows").querySelectorAll("tr.row")].map(tr => [tr.dataset.h, tr]));
+    const out = [];
+    for (const t of d.results) {
+      let tr = old.get(t.info_hash);
+      if (tr) { tr.classList.remove("fresh"); out.push(tr); if (tr.nextElementSibling?.classList.contains("detail")) out.push(tr.nextElementSibling); continue; }
+      const tb = document.createElement("tbody");
+      tb.innerHTML = rowHtml(t);
+      tr = tb.firstElementChild;
+      tr.classList.add("fresh");
+      out.push(tr);
+    }
+    $("rows").replaceChildren(...out);
+  } else {
+    $("rows").innerHTML = d.results.map(rowHtml).join("");
+  }
   $("prev").disabled = state.offset === 0;
   $("next").disabled = d.results.length < LIMIT;
 }
@@ -142,9 +223,12 @@ $("chips").onclick = e => { const c = e.target.closest(".chip"); if (!c) return;
 $("rows").onclick = e => { const tr = e.target.closest("tr.row"); if (tr) toggleDetail(tr); };
 $("prev").onclick = () => { state.offset = Math.max(0, state.offset - LIMIT); writeHash(); };
 $("next").onclick = () => { state.offset += LIMIT; writeHash(); };
+$("live").onclick = () => {
+  paused = !paused; localStorage.setItem("paused", paused ? "1" : "0"); renderLive();
+  if (!paused && liveView() && total > shownTotal) search(true); else renderMeta();
+};
 window.onhashchange = () => { readHash(); search(); loadStats(); };
-readHash(); search(); loadStats();
-setInterval(loadStats, 15000);
+readHash(); search(); renderLive(); connect();
 </script>
 </body>
 </html>
