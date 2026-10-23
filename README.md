@@ -7,6 +7,14 @@ millions of indexed torrents.
 It ships as a single ~3 MB binary. It needs no PostgreSQL, no Redis and no external services,
 because everything lives in one SQLite file.
 
+![Browsing the newest torrents, with content-type facets](docs/screenshots/browse.png)
+
+![Searching for "1080p" in TV shows, with the extracted episode, resolution, source and codec tags](docs/screenshots/search.png)
+
+The screenshots use a small demo database of public-domain and openly licensed releases
+(the names are made up), imported with `rustymagnet import`. Imported torrents have no
+file lists, so every row shows one file.
+
 ## Features
 
 - **DHT crawler**: BEP 5 node with BEP 51 `sample_infohashes` crawling. It answers incoming
@@ -58,6 +66,37 @@ For sizing a large index (15 M crawled-like torrents, 65 GB: disk, RAM, search t
 what is still slow), see [docs/scaling.md](docs/scaling.md). Text searches sorted by relevance,
 size or peers sort the newest 100 000 matches, so very common words stay fast on a large index.
 A search that still takes longer than 3 seconds is stopped with "add more words or filters".
+
+## Benchmarks: resource usage while crawling
+
+The release binary crawled the live DHT for 10 minutes with the default settings
+(`--rate 150`, `--fetchers 64`, `--max-nodes 50000`). It started from an empty database,
+ran in a Docker container behind NAT on a 16-core machine with 7.7 GB RAM, and had no
+inbound UDP port forwarded. CPU time and RSS come from `/proc/<pid>`, sampled every 10 s.
+The torrent, packet and node counts come from `/api/stats`.
+
+| Time | CPU (% of one core) | RSS | DHT nodes | Torrents stored | Database |
+|---:|---:|---:|---:|---:|---:|
+| 1 min | 1.4 % | 38 MB | 23 071 | 166 | 4.9 MB |
+| 2 min | 1.6 % | 45 MB | 37 565 | 222 | 4.9 MB |
+| 5 min | 1.3 % | 49 MB | 50 000 (cap) | 468 | 6.1 MB |
+| 10 min | 1.2 % | 59 MB | 50 000 (cap) | 838 | 8.4 MB |
+
+Over the whole 10 minutes:
+
+| | |
+|---|---|
+| CPU | 1.0–1.7 % of one core (average 1.3 %) |
+| Memory | 33 MB RSS at start, 61 MB peak. 6–7 threads |
+| DHT packets | ~151 out/s (the `--rate`), ~114 in/s (about 75 % answered) |
+| Network | ~1.1 Mbit/s down, ~0.3 Mbit/s up for the whole container, including metadata downloads |
+| Torrents | ~1.3/s stored (about 110 000 per day). 840 metadata fetches succeeded and 7 942 failed, mostly because of timeouts or refused connections |
+
+RSS grows mainly while the routing table fills up to `--max-nodes`, then levels off.
+With a 15 M-torrent database it was 92 MB after 3 minutes of crawling, because the
+Bloom filter of known hashes is bigger. See [docs/scaling.md](docs/scaling.md#ram). The DHT
+rate, not the CPU, is what limits the crawler. See [Choosing `--rate`](#choosing---rate)
+before you raise it.
 
 ## Running
 
