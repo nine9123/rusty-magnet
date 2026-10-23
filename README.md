@@ -7,9 +7,20 @@ millions of indexed torrents.
 It ships as a single ~3 MB binary. It needs no PostgreSQL, no Redis and no external services,
 because everything lives in one SQLite file.
 
-![Browsing the newest torrents, with content-type facets](docs/screenshots/browse.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/browse-dark.png">
+  <img alt="Browsing the newest torrents, with content-type facets" src="docs/screenshots/browse.png">
+</picture>
 
-![Searching for "1080p" in TV shows, with the extracted episode, resolution, source and codec tags](docs/screenshots/search.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/search-dark.png">
+  <img alt="Searching for &quot;1080p&quot; in TV shows, with the extracted episode, resolution, source and codec tags" src="docs/screenshots/search.png">
+</picture>
+
+The web UI follows the system light/dark setting, and so do the screenshots above. Both
+versions are in [`docs/screenshots`](docs/screenshots): [browse](docs/screenshots/browse.png) and
+[search](docs/screenshots/search.png) in light, [browse](docs/screenshots/browse-dark.png) and
+[search](docs/screenshots/search-dark.png) in dark.
 
 The screenshots use a small demo database of public-domain and openly licensed releases
 (the names are made up), imported with `rustymagnet import`. Imported torrents have no
